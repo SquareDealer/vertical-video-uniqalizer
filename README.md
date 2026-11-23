@@ -334,10 +334,15 @@ The editor can run unattended: it polls an S3 bucket for new clips and publishes
 TikTok versions of each one, so the same clip can be posted from different accounts.
 
 ```
-montage/<streamer>/<clip>.mp4                          ← new clip (read only)
-montage/<streamer>/uniqalized/<clip>__v1.mp4 … __v3.mp4  ← versions
-montage/<streamer>/uniqalized/<clip>.manifest.json     ← written last: the set is complete
+montage/<streamer>/<clip>.mp4                       ← new clip (read only)
+montage/<streamer>/uniqalized/<clip>/status.json    ← processing | waiting | done | failed
+montage/<streamer>/uniqalized/<clip>/v1.mp4 … v3.mp4 ← versions
+montage/<streamer>/uniqalized/<clip>/manifest.json  ← written last: the set is complete
 ```
+
+Each source gets its own folder named after it, so a clip and its versions are linked by the directory
+itself. `manifest.json` and every version also carry the `clip-id` set by the Autoclipper, the key a CRM
+can use to find the ticket. See [docs/crm-integration.md](docs/crm-integration.md).
 
 Every version plays the clip without its pauses, with Kamerton captions (see above), and differs from the
 others in layout, caption style, zoom, color, grain, speed and metadata. A webcam overlay is never cropped.
@@ -354,11 +359,11 @@ or open the **Auto (S3)** page of the app and click *Start*. `--set watch_varian
 `--set watch_interval=120` change the number of versions and the polling interval.
 
 **Integrity.** A clip counts as done only when its manifest names the current source (ETag and size) and
-all its versions exist with the listed sizes. Versions are uploaded to `uniqalized/.partial/`, checked
+all its versions exist with the listed sizes. Versions are uploaded to `uniqalized/<clip>/.partial/`, checked
 (MD5), then copied into place, and the manifest is written last. A crash, a network error or a source that
 is replaced simply means the clip is processed again on the next pass. If Kamerton is down the clip waits:
-nothing is published without captions. A clip that fails 3 times is set aside (reason in
-`<clip>.error.json`) until its file changes. Sources and anything outside `uniqalized/` are never touched.
+nothing is published without captions. A clip that fails 3 times is set aside (reason in its
+`status.json`, `"state": "failed"`) until its file changes. Sources and anything outside `uniqalized/` are never touched.
 
 ## Custom vocabulary packs
 

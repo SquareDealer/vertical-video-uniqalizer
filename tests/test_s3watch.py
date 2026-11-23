@@ -71,30 +71,42 @@ def keys(store, prefix=""):
     return sorted(o.key for o in store.list(prefix))
 
 
+def state(store, k):
+    return (store.get_json(k.status) or {}).get("state")
+
+
 def test_source_key_filter():
     assert is_source_key("montage/buster/a.MP4", "montage/")
     assert is_source_key("montage/buster/clip.mkv", "montage/")
     assert not is_source_key("montage/a.mp4", "montage/")
-    assert not is_source_key("montage/buster/uniqalized/a__v1.mp4", "montage/")
+    assert not is_source_key("montage/buster/uniqalized/a/v1.mp4", "montage/")
     assert not is_source_key("montage/buster/a.txt", "montage/")
     assert not is_source_key("to_sort/buster/a.mp4", "montage/")
 
 
 def test_output_keys_layout():
     k = output_keys(SOURCE, "uniqalized", 3)
-    assert k.final == [f"montage/buster/uniqalized/2026-11-20_reaction__v{i}.mp4" for i in (1, 2, 3)]
-    assert k.partial[0] == "montage/buster/uniqalized/.partial/2026-11-20_reaction__v1.mp4"
-    assert k.manifest == "montage/buster/uniqalized/2026-11-20_reaction.manifest.json"
-    assert k.error == "montage/buster/uniqalized/2026-11-20_reaction.error.json"
+    folder = "montage/buster/uniqalized/2026-11-20_reaction"
+    assert k.folder == folder, "one folder per source, named after it"
+    assert k.final == [f"{folder}/v{i}.mp4" for i in (1, 2, 3)]
+    assert k.partial[0] == f"{folder}/.partial/v1.mp4"
+    assert k.manifest == f"{folder}/manifest.json"
+    assert k.status == f"{folder}/status.json"
+    assert output_keys("montage/buster/clip.mov", "uniqalized", 3, unique=True).folder ==         "montage/buster/uniqalized/clip.mov"
 
 
 def test_happy_path_publishes_versions_then_manifest(store, tmp_path):
     source = put_source(store)
-    render = FakeRender()
+    k = output_keys(SOURCE, "uniqalized", 3)
+    seen = []
+    render = FakeRender(on_call=lambda: seen.append(store.get_json(k.status)))
     watcher, _ = make_watcher(store, tmp_path, render)
     summary = watcher.run_once(threading.Event())
     assert (summary.done, summary.failed) == (1, 0)
-    k = output_keys(SOURCE, "uniqalized", 3)
+    assert seen[0]["state"] == "processing" and seen[0]["clip_id"] == "clip-123"
+    assert seen[0]["source"] == {"key": SOURCE, "etag": source.etag}
+    done = store.get_json(k.status)
+    assert done["state"] == "done" and done["manifest"] == k.manifest and done["versions"] == k.final
     manifest = store.get_json(k.manifest)
     assert manifest["clip_id"] == "clip-123"
     assert manifest["source"]["key"] == SOURCE and manifest["source"]["etag"] == source.etag
@@ -105,7 +117,7 @@ def test_happy_path_publishes_versions_then_manifest(store, tmp_path):
         assert head.size == entry["size"] and head.etag == entry["md5"]
         assert head.metadata["clip-id"] == "clip-123" and head.metadata["variant"] == str(i)
         assert head.metadata["source-etag"] == source.etag
-    assert not keys(store, "montage/buster/uniqalized/.partial/")
+    assert not keys(store, f"{k.folder}/.partial/")
     assert is_ready(store, store.head(SOURCE), k)
     assert store.head(SOURCE).etag == source.etag, "the source is never touched"
 
@@ -140,7 +152,7 @@ def test_crash_after_partial_upload_leaves_no_manifest(store, tmp_path, monkeypa
     assert (summary.failed, summary.pending) == (0, 1), "a network error is retried, not counted"
     assert not any(store.head(key) for key in k.final) and store.get_json(k.manifest) is None
     assert WatchState(tmp_path / "state.json").data.get(SOURCE, {}).get("failures", 0) == 0
-    assert store.get_json(k.error) is None
+    assert state(store, k) == "waiting"
 
     monkeypatch.setattr(store, "upload", real_upload)
     assert watcher.run_once(threading.Event()).done == 1
@@ -185,7 +197,8 @@ def test_speech_server_down_keeps_clip_pending(store, tmp_path):
     watcher, _ = make_watcher(store, tmp_path, FakeRender(error=SpeechServerUnavailable("Kamerton is down")))
     summary = watcher.run_once(threading.Event())
     assert (summary.pending, summary.failed) == (1, 0)
-    assert store.get_json(output_keys(SOURCE, "uniqalized", 3).error) is None
+    status = store.get_json(output_keys(SOURCE, "uniqalized", 3).status)
+    assert status["state"] == "waiting" and "Kamerton is down" in status["reason"]
 
 
 def test_parked_after_three_failures(store, tmp_path):
@@ -195,14 +208,15 @@ def test_parked_after_three_failures(store, tmp_path):
     for _ in range(3):
         assert watcher.run_once(threading.Event()).failed == 1
     k = output_keys(SOURCE, "uniqalized", 3)
-    error = store.get_json(k.error)
-    assert error["failures"] == 3 and "broken file" in error["error"]
+    error = store.get_json(k.status)
+    assert error["state"] == "failed" and error["failures"] == 3 and error["parked"] is True
+    assert "broken file" in error["error"]
     summary = watcher.run_once(threading.Event())
     assert render.calls == 3 and summary.skipped == 1
     put_source(store, body=b"source-fixed")
     render.error = None
     assert watcher.run_once(threading.Event()).done == 1 and render.calls == 4
-    assert store.get_json(k.error) is None, "a successful run clears the error report"
+    assert state(store, k) == "done", "a successful run replaces the error report"
 
 
 def test_source_without_clip_id(store, tmp_path):
@@ -293,7 +307,7 @@ def test_network_error_is_retried_not_parked(store, tmp_path):
         summary = watcher.run_once(threading.Event())
         assert (summary.pending, summary.failed) == (1, 0)
     assert render.calls == 4
-    assert store.get_json(output_keys(SOURCE, "uniqalized", 3).error) is None
+    assert state(store, output_keys(SOURCE, "uniqalized", 3)) != "failed"
 
 
 def test_source_deleted_during_download_is_a_quiet_skip(store, tmp_path, monkeypatch):
@@ -307,7 +321,7 @@ def test_source_deleted_during_download_is_a_quiet_skip(store, tmp_path, monkeyp
     monkeypatch.setattr(store, "download", vanishing_download)
     summary = make_watcher(store, tmp_path, FakeRender())[0].run_once(threading.Event())
     assert (summary.failed, summary.skipped) == (0, 1)
-    assert store.get_json(output_keys(SOURCE, "uniqalized", 3).error) is None
+    assert state(store, output_keys(SOURCE, "uniqalized", 3)) != "failed"
 
 
 def test_stop_lets_the_current_clip_finish(store, tmp_path):
@@ -332,4 +346,4 @@ def test_dropped_download_is_retried_not_counted(store, tmp_path, monkeypatch):
     watcher, _ = make_watcher(store, tmp_path, FakeRender())
     summary = watcher.run_once(threading.Event())
     assert (summary.pending, summary.failed) == (1, 0)
-    assert store.get_json(output_keys(SOURCE, "uniqalized", 3).error) is None
+    assert state(store, output_keys(SOURCE, "uniqalized", 3)) != "failed"
