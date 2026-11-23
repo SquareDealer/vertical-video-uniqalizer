@@ -1,0 +1,226 @@
+"""Watch mode: S3 polling, publishing protocol and integrity of the versions of a clip."""
+
+import json
+import os
+import threading
+from pathlib import Path
+from urllib.parse import unquote
+
+import pytest
+
+boto3 = pytest.importorskip("boto3")
+moto = pytest.importorskip("moto")
+
+from auto_video_editor.s3store import S3Config, S3Store, file_md5  # noqa: E402
+from auto_video_editor.s3watch import (RenderedVariant, Watcher, WatchState, acquire_lock, is_ready,  # noqa: E402
+                                       is_source_key, output_keys)
+from auto_video_editor.settings import Settings  # noqa: E402
+from auto_video_editor.transcribe import SpeechServerUnavailable  # noqa: E402
+
+BUCKET = "watch-bucket"
+SOURCE = "montage/buster/2026-11-20_reaction.mp4"
+
+
+@pytest.fixture()
+def store(monkeypatch):
+    for name in ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "AWS_PROFILE"):
+        monkeypatch.delenv(name, raising=False)
+    with moto.mock_aws():
+        client = boto3.client("s3", region_name="us-east-1", aws_access_key_id="x", aws_secret_access_key="y")
+        client.create_bucket(Bucket=BUCKET)
+        yield S3Store(S3Config("https://s3.test", BUCKET, "k", "s", region="us-east-1"), client=client)
+
+
+def put_source(store, key=SOURCE, body=b"source-video", clip_id="clip-123"):
+    metadata = {"clip-id": clip_id} if clip_id else {}
+    store.client.put_object(Bucket=BUCKET, Key=key, Body=body, Metadata=metadata)
+    return store.head(key)
+
+
+class FakeRender:
+    """Writes ``count`` small distinct files instead of rendering video."""
+
+    def __init__(self, error=None, on_call=None):
+        self.calls, self.error, self.on_call = 0, error, on_call
+
+    def __call__(self, source: Path, work: Path, count: int, cancel: threading.Event):
+        self.calls += 1
+        assert source.exists() and source.read_bytes().startswith(b"source")
+        if self.on_call:
+            self.on_call()
+        if self.error:
+            raise self.error
+        result = []
+        for i in range(1, count + 1):
+            path = work / f"v{i}.mp4"
+            path.write_bytes(b"v%d-" % i + os.urandom(64))
+            result.append(RenderedVariant(path, {"index": i}, captions=True))
+        return result
+
+
+def make_watcher(store, tmp_path, render, **settings):
+    logs = []
+    watcher = Watcher(store, Settings(**settings), render, tmp_path / "work", WatchState(tmp_path / "state.json"),
+                      logs.append)
+    return watcher, logs
+
+
+def keys(store, prefix=""):
+    return sorted(o.key for o in store.list(prefix))
+
+
+def test_source_key_filter():
+    assert is_source_key("montage/buster/a.MP4", "montage/")
+    assert is_source_key("montage/buster/clip.mkv", "montage/")
+    assert not is_source_key("montage/a.mp4", "montage/")
+    assert not is_source_key("montage/buster/uniqalized/a__v1.mp4", "montage/")
+    assert not is_source_key("montage/buster/a.txt", "montage/")
+    assert not is_source_key("to_sort/buster/a.mp4", "montage/")
+
+
+def test_output_keys_layout():
+    k = output_keys(SOURCE, "uniqalized", 3)
+    assert k.final == [f"montage/buster/uniqalized/2026-11-20_reaction__v{i}.mp4" for i in (1, 2, 3)]
+    assert k.partial[0] == "montage/buster/uniqalized/.partial/2026-11-20_reaction__v1.mp4"
+    assert k.manifest == "montage/buster/uniqalized/2026-11-20_reaction.manifest.json"
+    assert k.error == "montage/buster/uniqalized/2026-11-20_reaction.error.json"
+
+
+def test_happy_path_publishes_versions_then_manifest(store, tmp_path):
+    source = put_source(store)
+    render = FakeRender()
+    watcher, _ = make_watcher(store, tmp_path, render)
+    summary = watcher.run_once(threading.Event())
+    assert (summary.done, summary.failed) == (1, 0)
+    k = output_keys(SOURCE, "uniqalized", 3)
+    manifest = store.get_json(k.manifest)
+    assert manifest["clip_id"] == "clip-123"
+    assert manifest["source"]["key"] == SOURCE and manifest["source"]["etag"] == source.etag
+    assert manifest["captions"] is True
+    for i, entry in enumerate(manifest["variants"], 1):
+        head = store.head(entry["key"])
+        assert entry["key"] == k.final[i - 1]
+        assert head.size == entry["size"] and head.etag == entry["md5"]
+        assert head.metadata["clip-id"] == "clip-123" and head.metadata["variant"] == str(i)
+        assert head.metadata["source-etag"] == source.etag
+    assert not keys(store, "montage/buster/uniqalized/.partial/")
+    assert is_ready(store, store.head(SOURCE), k)
+    assert store.head(SOURCE).etag == source.etag, "the source is never touched"
+
+    summary = watcher.run_once(threading.Event())
+    assert (summary.done, summary.skipped) == (0, 1) and render.calls == 1
+
+
+def test_unicode_keys(store, tmp_path):
+    key = "montage/бустер/клип 1+2.mp4"
+    put_source(store, key=key)
+    watcher, _ = make_watcher(store, tmp_path, FakeRender())
+    assert watcher.run_once(threading.Event()).done == 1
+    k = output_keys(key, "uniqalized", 3)
+    assert unquote(store.head(k.final[0]).metadata["source-key"]) == key
+    assert store.get_json(k.manifest)["source"]["key"] == key
+
+
+def test_crash_after_partial_upload_leaves_no_manifest(store, tmp_path, monkeypatch):
+    put_source(store)
+    real_upload, calls = store.upload, []
+
+    def flaky_upload(*args, **kwargs):
+        calls.append(1)
+        if len(calls) == 2:
+            raise ConnectionError("network down")
+        return real_upload(*args, **kwargs)
+
+    monkeypatch.setattr(store, "upload", flaky_upload)
+    watcher, _ = make_watcher(store, tmp_path, FakeRender())
+    summary = watcher.run_once(threading.Event())
+    k = output_keys(SOURCE, "uniqalized", 3)
+    assert summary.failed == 1
+    assert not any(store.head(key) for key in k.final) and store.get_json(k.manifest) is None
+    assert WatchState(tmp_path / "state.json").data[SOURCE]["failures"] == 1
+
+    monkeypatch.setattr(store, "upload", real_upload)
+    assert watcher.run_once(threading.Event()).done == 1
+    assert is_ready(store, store.head(SOURCE), k)
+
+
+def test_source_changed_triggers_rebuild(store, tmp_path):
+    put_source(store)
+    render = FakeRender()
+    watcher, _ = make_watcher(store, tmp_path, render)
+    watcher.run_once(threading.Event())
+    k = output_keys(SOURCE, "uniqalized", 3)
+    old_md5 = store.head(k.final[0]).etag
+    new = put_source(store, body=b"source-video-v2")
+    assert not is_ready(store, new, k)
+    assert watcher.run_once(threading.Event()).done == 1
+    assert store.get_json(k.manifest)["source"]["etag"] == new.etag
+    assert store.head(k.final[0]).etag != old_md5 and render.calls == 2
+
+
+def test_fewer_versions_removes_stale_ones(store, tmp_path):
+    put_source(store)
+    make_watcher(store, tmp_path, FakeRender())[0].run_once(threading.Event())
+    put_source(store, body=b"source-video-v2")
+    watcher, _ = make_watcher(store, tmp_path, FakeRender(), watch_variants=2)
+    assert watcher.run_once(threading.Event()).done == 1
+    assert store.head(output_keys(SOURCE, "uniqalized", 3).final[2]) is None
+
+
+def test_source_vanished_mid_render(store, tmp_path):
+    put_source(store)
+    render = FakeRender(on_call=lambda: store.delete(SOURCE))
+    watcher, _ = make_watcher(store, tmp_path, render)
+    summary = watcher.run_once(threading.Event())
+    assert summary.failed == 0
+    assert not keys(store, "montage/buster/uniqalized/")
+    assert WatchState(tmp_path / "state.json").data.get(SOURCE, {}).get("failures", 0) == 0
+
+
+def test_speech_server_down_keeps_clip_pending(store, tmp_path):
+    put_source(store)
+    watcher, _ = make_watcher(store, tmp_path, FakeRender(error=SpeechServerUnavailable("Kamerton is down")))
+    summary = watcher.run_once(threading.Event())
+    assert (summary.pending, summary.failed) == (1, 0)
+    assert store.get_json(output_keys(SOURCE, "uniqalized", 3).error) is None
+
+
+def test_parked_after_three_failures(store, tmp_path):
+    put_source(store)
+    render = FakeRender(error=ValueError("broken file"))
+    watcher, _ = make_watcher(store, tmp_path, render)
+    for _ in range(3):
+        assert watcher.run_once(threading.Event()).failed == 1
+    k = output_keys(SOURCE, "uniqalized", 3)
+    error = store.get_json(k.error)
+    assert error["failures"] == 3 and "broken file" in error["error"]
+    summary = watcher.run_once(threading.Event())
+    assert render.calls == 3 and summary.skipped == 1
+    put_source(store, body=b"source-fixed")
+    render.error = None
+    assert watcher.run_once(threading.Event()).done == 1 and render.calls == 4
+    assert store.get_json(k.error) is None, "a successful run clears the error report"
+
+
+def test_source_without_clip_id(store, tmp_path):
+    put_source(store, clip_id=None)
+    make_watcher(store, tmp_path, FakeRender())[0].run_once(threading.Event())
+    manifest = store.get_json(output_keys(SOURCE, "uniqalized", 3).manifest)
+    assert manifest["clip_id"] is None
+
+
+def test_lock_rejects_second_watcher(tmp_path):
+    lock = tmp_path / "watch.lock"
+    with acquire_lock(lock):
+        with pytest.raises(RuntimeError, match="another watcher"):
+            with acquire_lock(lock):
+                pass
+    with acquire_lock(lock):  # released, can be taken again
+        pass
+
+
+def test_stale_lock_is_replaced(tmp_path):
+    lock = tmp_path / "watch.lock"
+    lock.write_text("999999999")
+    with acquire_lock(lock):
+        assert lock.read_text().strip() == str(os.getpid())

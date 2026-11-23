@@ -134,6 +134,12 @@ class Settings:
     stt_url: str = "http://localhost:8091/v1"
     stt_api_key: str = ""
     stt_model: str = "kamerton"
+    # Auto mode (python main.py --watch): poll S3 for new clips and publish TikTok versions
+    watch_prefix: str = "montage/"
+    watch_subdir: str = "uniqalized"
+    watch_variants: int = 3
+    watch_interval: int = 60
+    watch_max_failures: int = 3
     language: str = ""  # empty = auto-detect
     beam_size: int = 5
     vocabulary: List[str] = field(default_factory=list)  # names/jargon the transcriber should know
@@ -292,6 +298,9 @@ class Settings:
         check_range("caption_size", 40, 250)
         check_range("caption_words", 1, 8)
         check_range("beam_size", 1, 10)
+        check_range("watch_variants", 1, 10)
+        check_range("watch_interval", 10, 3600)
+        check_range("watch_max_failures", 1, 100)
         check_range("audio_bitrate", 64, 320)
         if not re.fullmatch(r"#?[0-9a-fA-F]{6}", self.caption_color.strip()):
             errors.append("caption_color must be a hex color such as #FFE600")
