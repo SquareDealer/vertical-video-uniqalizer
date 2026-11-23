@@ -107,6 +107,10 @@ class Settings:
     shorts_auto: bool = True       # number of shorts = number of great moments
     shorts_min: float = 20.0
     shorts_max: float = 59.0
+    # Whole-clip mode (auto mode for TikTok): one short = the whole clip minus dead air.
+    whole_clip: bool = False
+    whole_clip_max: float = 180.0   # longer clips are cut to their best fragment...
+    whole_clip_cut: float = 90.0    # ...of at most this length
     shorts_layout: str = "auto"
     shorts_hook: bool = False      # open each short with its best 3 seconds, then play it from the start
     facecam: str = ""  # "x,y,w,h" as fractions of the frame, used by the split layout

@@ -42,6 +42,7 @@ ANALYSIS_KEYS = (
     "diversity", "min_score", "beam_size", "weight_loudness", "weight_spikes", "weight_speech", "weight_keywords",
     "weight_exclamations", "skip_start", "skip_end", "auto_trim", "vocabulary", "vocabulary_packs", "auto_vocabulary",
     "profanity_prompt", "censor_profanity", "censor_words", "diarize", "speaker_count",
+    "whole_clip", "whole_clip_max", "whole_clip_cut",
 )
 
 
@@ -301,9 +302,10 @@ class Pipeline:
         min_clip = min(s.min_clip, max(2.0, info.duration / 4))
         max_clip = max(min_clip, s.max_clip)
         limit = max(40, int(s.target_for(info.duration) / min_clip * 3) + 30)
-        candidates = find_candidates(curve, env, transcript, info.duration, min_clip, max_clip, limit,
-                                     lead=s.context_before, tail=s.context_after)
-        if not candidates:
+        whole = s.whole_clip and info.duration <= s.whole_clip_max
+        candidates = [] if whole else find_candidates(curve, env, transcript, info.duration, min_clip, max_clip,
+                                                      limit, lead=s.context_before, tail=s.context_after)
+        if not candidates and not s.whole_clip:
             raise RuntimeError("No usable moments were found. Is the audio track silent?")
         weak = [c for c in candidates if c.score < s.min_score]
         if weak and len(weak) < len(candidates):
@@ -313,12 +315,14 @@ class Pipeline:
         else:
             self.log(f"Found {len(candidates)} candidate moments.")
 
-        if s.profile == "auto" and s.target_duration <= 0:
+        if s.whole_clip:
+            s.shorts_auto, s.shorts_count = False, 1
+        elif s.profile == "auto" and s.target_duration <= 0:
             s.target_duration = round(auto_target(candidates, info.duration, s.min_score), 1)
             self.log(f"Reel length: {format_clock(s.target_duration)} (auto: follows the number of great moments).")
             auto.append(["Reel length", format_clock(s.target_duration)])
         target = s.target_for(info.duration)
-        if s.shorts_auto:
+        if s.shorts_auto and not s.whole_clip:
             s.shorts_count = auto_shorts_count(candidates, info.duration)
             self.log(f"Shorts: {s.shorts_count} (auto: one per great moment).")
             auto.append(["Shorts", str(s.shorts_count)])
@@ -342,10 +346,24 @@ class Pipeline:
             # Pick moments by their length after dead air is removed, so the reel hits the target.
             for candidate in candidates:
                 self._attach_details(candidate, env, transcript)
-        highlight = select_highlight(candidates, target, info.duration, s.pad_before, s.pad_after,
-                                     jump_cuts=s.jump_cuts, diversity=s.diversity)
-        shorts = []
-        if s.shorts_count > 0:
+        if s.whole_clip:
+            highlight = []
+            if whole:
+                shorts = [self._whole_clip_moment(transcript, info.duration)]
+                self.log(f"Whole clip: one vertical short of {format_clock(shorts[0].duration)} before cuts.")
+            else:
+                shorts = plan_shorts(candidates, curve, transcript, env, info.duration, 1, min(20.0, s.whole_clip_cut),
+                                     s.whole_clip_cut, s.pad_before, s.pad_after) if candidates else []
+                if not shorts:  # no peak at all: the clip was still chosen by a person, keep its start
+                    shorts = [Moment(start=0.0, end=min(info.duration, s.whole_clip_cut), score=50.0,
+                                     peak=min(info.duration, s.whole_clip_cut) / 2, reasons=["clip start"])]
+                self.log(f"Clip longer than {format_clock(s.whole_clip_max)}: best fragment of at most "
+                         f"{format_clock(s.whole_clip_cut)} kept.")
+        else:
+            highlight = select_highlight(candidates, target, info.duration, s.pad_before, s.pad_after,
+                                         jump_cuts=s.jump_cuts, diversity=s.diversity)
+            shorts = []
+        if s.shorts_count > 0 and not s.whole_clip:
             shorts = plan_shorts(candidates, curve, transcript, env, info.duration, s.shorts_count,
                                  s.shorts_min, s.shorts_max, s.pad_before, s.pad_after)
         for moment in highlight:
@@ -457,9 +475,21 @@ class Pipeline:
         threshold = self.settings.silence_threshold if self.settings.silence_threshold < 0 else None
         keep = compute_keep_ranges(moment.start, moment.end, env, moment.words, self.settings.min_silence,
                                    threshold)
-        if is_short and total_duration(keep) < min(self.settings.shorts_min, moment.duration):
-            return []  # jump cuts must not shrink a short below its minimum length
+        # Jump cuts must not shrink a short below its minimum length. A whole clip keeps its cuts: pauses
+        # are what loses a TikTok viewer, only a nearly empty result falls back to the uncut clip.
+        minimum = 5.0 if self.settings.whole_clip else self.settings.shorts_min
+        if is_short and total_duration(keep) < min(minimum, moment.duration):
+            return []
         return keep
+
+    @staticmethod
+    def _whole_clip_moment(transcript: Optional[Transcript], duration: float) -> Moment:
+        words = list(transcript.words()) if transcript is not None else []
+        start, end = 0.0, duration
+        if words:
+            start = max(0.0, words[0].start - 0.3)
+            end = min(duration, words[-1].end + 0.5)
+        return Moment(start=start, end=end, score=100.0, peak=(start + end) / 2, reasons=["whole clip"])
 
     def _cache_file(self, kind: str, name: str) -> Path:
         return cache_dir() / kind / name

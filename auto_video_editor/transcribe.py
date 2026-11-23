@@ -435,6 +435,10 @@ class Transcriber:
 # -- remote speech server ----------------------------------------------------------------------
 
 HTTP_BACKEND = "http"
+
+
+class SpeechServerUnavailable(RuntimeError):
+    """The speech server cannot be reached or its engine is not ready (502/503). Worth retrying later."""
 HTTP_TIMEOUT = 900.0  # one 10 minute window on a slow CPU server
 
 
@@ -492,10 +496,11 @@ class SpeechServer:
             except ValueError:
                 pass
             hint = " Check the API key." if exc.code in (401, 403) else ""
-            raise RuntimeError(f"Speech server error {exc.code} at {self.url}{path}: {detail}{hint}") from exc
+            error = SpeechServerUnavailable if exc.code in (502, 503) else RuntimeError
+            raise error(f"Speech server error {exc.code} at {self.url}{path}: {detail}{hint}") from exc
         except (urllib.error.URLError, OSError) as exc:
             reason = getattr(exc, "reason", exc)
-            raise RuntimeError(f"Cannot reach the speech server at {self.url} ({reason}). "
+            raise SpeechServerUnavailable(f"Cannot reach the speech server at {self.url} ({reason}). "
                                "Is it running? For Kamerton: docker compose up -d in its folder.") from exc
         try:
             return json.loads(body.decode("utf-8"))
