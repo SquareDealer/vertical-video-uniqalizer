@@ -253,7 +253,8 @@ def _watch(args: argparse.Namespace) -> int:
         print(message, flush=True)
 
     try:
-        config = S3Config.from_env(Path(args.env_file).expanduser() if args.env_file else None)
+        env_file = Path(args.env_file).expanduser() if args.env_file else None
+        config = S3Config.from_env(env_file)
     except RuntimeError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
@@ -271,7 +272,8 @@ def _watch(args: argparse.Namespace) -> int:
         with s3watch.acquire_lock(root / "watch.lock"):
             watcher = s3watch.Watcher(open_store(config), settings, s3watch.default_render_fn(settings, log),
                                       root / "work", s3watch.WatchState(root / "state.json"), log,
-                                      speech_check=s3watch.speech_check_for(settings))
+                                      speech_check=s3watch.speech_check_for(settings),
+                                      webhook=s3watch.webhook_for(root, log, env_file))
             stop = threading.Event()
             if args.once:
                 summary = watcher.run_once(stop)

@@ -347,3 +347,41 @@ def test_dropped_download_is_retried_not_counted(store, tmp_path, monkeypatch):
     summary = watcher.run_once(threading.Event())
     assert (summary.pending, summary.failed) == (1, 0)
     assert state(store, output_keys(SOURCE, "uniqalized", 3)) != "failed"
+
+
+def test_webhook_after_publish(store, tmp_path):
+    from test_webhook import CRM  # noqa: E402
+    from auto_video_editor.webhook import WebhookConfig, WebhookOutbox
+
+    crm = CRM()
+    try:
+        put_source(store)
+        watcher, logs = make_watcher(store, tmp_path, FakeRender())
+        watcher.webhook = WebhookOutbox(tmp_path / "webhook.json", WebhookConfig(crm.url), logs.append)
+        assert watcher.run_once(threading.Event()).done == 1
+        k = output_keys(SOURCE, "uniqalized", 3)
+        manifest = store.get_json(k.manifest)
+        event = json.loads(crm.requests[0]["body"])
+        assert event["event"] == "published" and event["clip_id"] == "clip-123"
+        assert event["versions"] == [v["key"] for v in manifest["variants"]] == k.final
+        assert event["manifest"] == manifest and event["folder"] == k.folder
+    finally:
+        crm.close()
+
+
+def test_webhook_failure_does_not_undo_publish(store, tmp_path):
+    from test_webhook import CRM  # noqa: E402
+    from auto_video_editor.webhook import WebhookConfig, WebhookOutbox
+
+    crm = CRM(codes=[500])
+    try:
+        put_source(store)
+        watcher, logs = make_watcher(store, tmp_path, FakeRender())
+        watcher.webhook = WebhookOutbox(tmp_path / "webhook.json", WebhookConfig(crm.url), logs.append)
+        summary = watcher.run_once(threading.Event())
+        k = output_keys(SOURCE, "uniqalized", 3)
+        assert summary.done == 1 and summary.failed == 0
+        assert is_ready(store, store.head(SOURCE), k) and state(store, k) == "done"
+        assert len(watcher.webhook.pending()) == 1
+    finally:
+        crm.close()

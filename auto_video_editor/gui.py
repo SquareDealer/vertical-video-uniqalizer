@@ -2348,7 +2348,8 @@ class App:
                     f"{settings.watch_interval} s.")
                 watcher = s3watch.Watcher(store, settings, s3watch.default_render_fn(settings, log), root / "work",
                                           s3watch.WatchState(root / "state.json"), log,
-                                          speech_check=s3watch.speech_check_for(settings))
+                                          speech_check=s3watch.speech_check_for(settings),
+                                          webhook=s3watch.webhook_for(root, log))
                 watcher.run_forever(stop)
         except Exception as exc:  # noqa: BLE001
             log(f"Watcher stopped: {exc}")

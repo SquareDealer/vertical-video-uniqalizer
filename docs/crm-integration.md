@@ -79,8 +79,63 @@ montage/<стример>/uniqalized/<имя>/manifest.json     ← пишетс�
  "app_version": "2.2.0", "created": "…", "stt": {"url": "http://localhost:8091/v1", "model": "kamerton"}}
 ```
 
-## Позже: мгновенное уведомление
+## Webhook: мгновенное уведомление о публикации
 
-Если CRM нужен статус без задержки опроса, AVE может после записи манифеста отправлять webhook
-(`POST` с тем же JSON, что в `manifest.json`). Для этого нужен адрес API и ключ. Бакет при этом
-остаётся источником истины.
+Опрашивать бакет не обязательно: если в `.env` AVE задан `AVE_WEBHOOK_URL`, после записи `manifest.json`
+и `status.json` (`done`) AVE отправляет на этот адрес `POST`. Бакет остаётся источником истины: если
+webhook не дошёл, публикация не отменяется.
+
+Заголовки:
+
+| Заголовок | Значение |
+|---|---|
+| `Content-Type` | `application/json` |
+| `X-AVE-Event` | `published` |
+| `X-AVE-Event-Id` | `<clip_id>:<etag исходника>` (без clip-id: `<ключ исходника>:<etag>`) |
+| `X-AVE-Signature` | `sha256=<HMAC-SHA256 тела запроса ключом AVE_WEBHOOK_SECRET, hex>`; только если секрет задан |
+
+Тело:
+
+```json
+{"event": "published", "event_id": "a7cdbf5a-…:d8773630…-8", "clip_id": "a7cdbf5a-…",
+ "source": {"key": "montage/buster/…mp4", "etag": "d8773630…-8", "size": 63611757, "last_modified": "…"},
+ "folder": "montage/buster/uniqalized/2026-11-20_21-59-44_reaction_6f4a",
+ "versions": ["…/v1.mp4", "…/v2.mp4", "…/v3.mp4"],
+ "manifest_key": "…/manifest.json", "status_key": "…/status.json",
+ "manifest": {"manifest_version": 1, "…": "полный manifest.json"}}
+```
+
+Что делать CRM:
+
+1. Проверить подпись: посчитать HMAC-SHA256 от **сырых байтов тела** тем же секретом и сравнить
+   с `X-AVE-Signature` за постоянное время (`hmac.compare_digest`).
+2. Найти тикет по `clip_id`, если его нет, то по `source.key`, и перевести в «версии готовы».
+3. Ответить `2xx` быстро (до 15 секунд). Тяжёлую работу делать после ответа.
+4. Повторы нормальны: одно событие может прийти больше одного раза. Если `event_id` уже обработан,
+   ответить `200` и ничего не менять. Если исходник заменили и перерендерили, придёт новое событие
+   с новым etag в `event_id`.
+
+Ответы и повторы:
+
+- `2xx`: доставлено.
+- Ошибка сети, `5xx`, `408`, `429`: AVE повторит через 30 с, 1, 2, 4 … минуты, не реже раза в час,
+  в том числе после перезапуска (очередь лежит в `webhook.json` рядом с `state.json`).
+- Другие `4xx`: AVE считает, что CRM отклонила само событие, и больше его не шлёт (пишет в лог и
+  в `webhook.json`, раздел `rejected`). Статус тикета тогда берите из `status.json`.
+
+Настройка на стороне AVE (`.env`):
+
+```
+AVE_WEBHOOK_URL=https://crm.example/api/ave/events
+AVE_WEBHOOK_SECRET=<общий секрет, тот же в CRM>
+```
+
+Пример проверки на Python:
+
+```python
+import hashlib, hmac
+
+def valid(raw_body: bytes, header: str, secret: str) -> bool:
+    expected = "sha256=" + hmac.new(secret.encode(), raw_body, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, header or "")
+```
