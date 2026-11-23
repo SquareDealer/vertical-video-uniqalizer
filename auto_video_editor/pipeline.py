@@ -6,8 +6,9 @@ import hashlib
 import json
 import os
 import shutil
+import uuid
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -24,6 +25,7 @@ from .insights import (VideoInsights, auto_layout, auto_model, auto_shorts_count
 from .moments import (Moment, build_curve, compute_hook, compute_keep_ranges, find_candidates, plan_shorts,
                       select_highlight)
 from .render import Renderer, caption_margin, loudnorm_apply_filter
+from .variants import VariantSpec, speed_words
 from .reporting import Reporter
 from .settings import CONTENT_LABELS, Settings, cache_dir
 from .speakers import assign_speakers
@@ -757,6 +759,95 @@ class Pipeline:
                 "score": m.score, "reasons": ", ".join(m.reasons), "text": m.text,
             })
 
+    def _render_one_short(self, project: Project, m: Moment, path: Path, renderer: Renderer, work: Path,
+                          ranges: list, captions_name: str, layout: str, facecam, adaptive: bool,
+                          on_progress=None, speed: float = 1.0, **render_options) -> Tuple[str, Optional[float], list]:
+        """Render one vertical short; returns the layout used, the face position and the caption words."""
+        s, info = self.settings, project.media
+        short_layout, subject_x = layout, None
+        if vision.available() and (layout == "smart" or (layout == "split" and adaptive)):
+            try:
+                subject_x, big_faces = vision.analyse_window(info, m.start, m.duration)
+            except Exception as exc:  # face detection is a nice-to-have, never fatal
+                subject_x, big_faces = None, 0.0
+                self.log(f"  face detection failed ({exc})")
+            if layout == "split" and big_faces >= 0.5:
+                short_layout = "smart"
+                self.log("  full-screen camera in this moment: face tracking instead of the split layout")
+            if short_layout == "smart":
+                self.log("  face detected, crop follows the speaker" if subject_x is not None
+                         else "  no face detected, using a centered crop")
+
+        captions_file = None
+        timed_words = remap_words_sequence(m.words, ranges) if m.words else []
+        if s.captions and timed_words:
+            captions_file = captions_name
+            ass = build_ass(speed_words(timed_words, speed), style=s.caption_style,
+                            margin_v=caption_margin(short_layout, info),
+                            font=s.caption_font, size_scale=s.caption_size / 100.0,
+                            uppercase=s.caption_uppercase, highlight=s.caption_color,
+                            max_words=s.caption_words, position=s.caption_position,
+                            speaker_colors=s.caption_speaker_colors)
+            (work / captions_file).write_text(ass, encoding="utf-8")
+
+        audio_filter = None
+        if s.normalize_audio:
+            measured = renderer.measure_segment_loudness(ranges, s.target_lufs)
+            audio_filter = loudnorm_apply_filter(measured, s.target_lufs)
+
+        renderer.render_segment(
+            ranges, path, layout=short_layout, subject_x=subject_x, facecam=facecam,
+            captions_file=captions_file, audio_filter=audio_filter, cwd=str(work), on_progress=on_progress,
+            speed=speed, **render_options,
+        )
+        return short_layout, subject_x, timed_words
+
+    def render_variant(self, project: Project, spec: VariantSpec, output: Path) -> Tuple[Path, bool]:
+        """Render ``project.shorts[0]`` as one TikTok version; returns the file and whether captions were burned."""
+        user = self.settings
+        s = project.effective_settings(user)
+        if s.shorts_layout == "auto":
+            s.shorts_layout = "blur"
+        s.caption_style, s.caption_color, s.caption_position = spec.caption_style, spec.caption_color, spec.caption_position
+        s.shorts_hook, s.quality = spec.hook, spec.quality
+        self.settings = s
+        output = Path(output)
+        work = output.parent / f".work-{output.stem}"
+        try:
+            require_tools()
+            info = project.media
+            if not os.path.isfile(info.path):
+                raise FileNotFoundError(f"Source video not found: {info.path}")
+            if not project.shorts:
+                raise ValueError("Nothing to render: the project has no short.")
+            m = project.shorts[0]
+            env = self._envelope or self._cached_envelope(info)
+            if env is not None:
+                m.keep = self._jump_cut_ranges(m, env, is_short=True)
+            ranges = m.ranges(s.shorts_jump_cuts)
+            if s.shorts_hook and m.hook:
+                ranges = list(m.hook) + ranges
+            facecam = s.facecam_rect() if s.facecam.strip() else None
+            layout = spec.layout if (spec.layout != "split" or facecam) else "blur"
+            output.parent.mkdir(parents=True, exist_ok=True)
+            work.mkdir(parents=True, exist_ok=True)
+            renderer = Renderer(info, pick_encoder(s.encoder), spec.quality, self.reporter.cancel_event,
+                                audio_bitrate=s.audio_bitrate, blur=s.blur_strength,
+                                audio_track=self._track(info, "output_audio_track"))
+            stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+            extra = ["-g", str(spec.gop), "-map_metadata", "-1", "-metadata", f"comment={uuid.uuid4().hex}",
+                     "-metadata", f"creation_time={stamp}"]
+            self.log(f"Version {spec.index}: {layout} layout, {spec.caption_style} captions {spec.caption_position}"
+                     f"{', hook' if s.shorts_hook and m.hook else ''}, speed {spec.speed:g}, zoom {spec.zoom:g}.")
+            _layout, _x, words = self._render_one_short(
+                project, m, output, renderer, work, ranges, f"v{spec.index}.ass", layout, facecam, adaptive=False,
+                speed=spec.speed, game_zoom=spec.zoom, game_shift=spec.shift, split_top=spec.split_top,
+                video_effects=spec.effects, extra_output_args=extra)
+            return output, bool(words) and s.captions
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
+            self.settings = user
+
     def _render_shorts(self, project: Project, moments: List[Moment], renderer: Renderer, out: Path,
                        work: Path, result: RenderResult, rows: List[dict]) -> None:
         s, r, info = self.settings, self.reporter, project.media
@@ -793,41 +884,9 @@ class Pipeline:
             self.log(f"Short {i}/{len(moments)}: {format_clock(m.start, True)} ({length:.1f}s{hook_note}, "
                      f"score {m.score:.0f}) \"{title}\"")
 
-            short_layout, subject_x = layout, None
-            if vision.available() and (layout == "smart" or (layout == "split" and adaptive)):
-                try:
-                    subject_x, big_faces = vision.analyse_window(info, m.start, m.duration)
-                except Exception as exc:  # face detection is a nice-to-have, never fatal
-                    subject_x, big_faces = None, 0.0
-                    self.log(f"  face detection failed ({exc})")
-                if layout == "split" and big_faces >= 0.5:
-                    short_layout = "smart"
-                    self.log("  full-screen camera in this moment: face tracking instead of the split layout")
-                if short_layout == "smart":
-                    self.log("  face detected, crop follows the speaker" if subject_x is not None
-                             else "  no face detected, using a centered crop")
-
-            captions_file = None
-            timed_words = remap_words_sequence(m.words, ranges) if m.words else []
-            if s.captions and timed_words:
-                captions_file = f"short_{i:02d}.ass"
-                ass = build_ass(timed_words, style=s.caption_style, margin_v=caption_margin(short_layout, info),
-                                font=s.caption_font, size_scale=s.caption_size / 100.0,
-                                uppercase=s.caption_uppercase, highlight=s.caption_color,
-                                max_words=s.caption_words, position=s.caption_position,
-                                speaker_colors=s.caption_speaker_colors)
-                (work / captions_file).write_text(ass, encoding="utf-8")
-
-            audio_filter = None
-            if s.normalize_audio:
-                measured = renderer.measure_segment_loudness(ranges, s.target_lufs)
-                audio_filter = loudnorm_apply_filter(measured, s.target_lufs)
-
-            renderer.render_segment(
-                ranges, path, layout=short_layout, subject_x=subject_x, facecam=facecam,
-                captions_file=captions_file, audio_filter=audio_filter, cwd=str(work),
-                on_progress=lambda p, base=done, length=length: progress((base + p * length) / total),
-            )
+            short_layout, subject_x, timed_words = self._render_one_short(
+                project, m, path, renderer, work, ranges, f"short_{i:02d}.ass", layout, facecam, adaptive,
+                on_progress=lambda p, base=done, length=length: progress((base + p * length) / total))
             result.shorts.append(path)
             if s.export_srt and timed_words:
                 path.with_suffix(".srt").write_text(build_srt(timed_words), encoding="utf-8")
