@@ -391,6 +391,13 @@ def has_cuda() -> bool:
     return False
 
 
+def whisper_on_gpu() -> bool:
+    """True when the speech model can actually run on an NVIDIA GPU (card + CUDA libraries)."""
+    from .transcribe import cuda_compute_type
+
+    return cuda_compute_type() is not None
+
+
 def fast_cpu() -> bool:
     return (sys.platform == "darwin" and platform.machine() == "arm64") or (os.cpu_count() or 2) >= 8
 
@@ -402,7 +409,7 @@ def auto_model(duration: float) -> Tuple[str, str]:
     ``base`` at ~0.25x. The most accurate model is only worth it when it stays affordable.
     """
     hours = duration / 3600
-    if has_cuda():
+    if whisper_on_gpu():
         return ("large-v3", "NVIDIA GPU") if hours <= 2.5 else ("turbo", "NVIDIA GPU, long recording")
     if fast_cpu():
         if hours <= 1.0:
@@ -419,7 +426,7 @@ _REALTIME = {"tiny": 0.10, "base": 0.25, "small": 0.70, "medium": 2.0, "large-v3
 
 def estimate_transcription(duration: float, model: str) -> float:
     factor = _REALTIME.get(model, 0.7)
-    if has_cuda():
+    if whisper_on_gpu():
         factor *= 0.06
     elif not fast_cpu():
         factor *= 2.0

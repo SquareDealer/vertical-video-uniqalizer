@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import argparse
 import sys
+import threading
 from pathlib import Path
 from typing import List, Optional
 
 from . import __app_name__, __version__
 from .reporting import Cancelled, Reporter
+from .s3store import S3Config, S3Store
+from .settings import cache_dir, settings_path
 from .settings import (CAPTION_STYLES, CONTENT_TYPES, ENCODERS, PROFILES, QUALITIES, SHORTS_LAYOUTS,
                        TRANSCRIBERS, TRANSITIONS, WHISPER_MODELS, Settings)
 from .timeline import parse_duration
@@ -58,6 +61,11 @@ def build_parser() -> argparse.ArgumentParser:
                    help="change any setting, e.g. --set caption_color=#00FF88 (repeatable)")
     p.add_argument("--list-settings", action="store_true", help="list every setting with its default value")
     p.add_argument("--list-packs", action="store_true", help="list the vocabulary packs (games and topics)")
+    p.add_argument("--watch", action="store_true",
+                   help="auto mode: poll the S3 bucket (montage/<streamer>/) and publish TikTok versions of new "
+                        "clips to <streamer>/uniqalized/ (credentials in .env, see .env.example)")
+    p.add_argument("--once", action="store_true", help="with --watch: run a single cycle and exit")
+    p.add_argument("--env-file", metavar="PATH", help="with --watch: file with the AVE_S3_* settings (default: .env)")
     p.add_argument("--version", action="version", version=f"{__app_name__} {__version__}")
 
     g = p.add_argument_group("highlight reel")
@@ -92,6 +100,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="audio track to analyze in a multi-track recording, e.g. 2 for an OBS mic track "
                         "(default: 1)")
     g.add_argument("--transcriber", choices=TRANSCRIBERS, help="speech-to-text engine (default: auto)")
+    g.add_argument("--stt-url", help="address of an OpenAI-compatible speech server for --transcriber http "
+                                     "(default: http://localhost:8091/v1, a local Kamerton)")
+    g.add_argument("--stt-key", help="API key of the speech server (default: none)")
+    g.add_argument("--stt-model", help="model name sent to the speech server (default: kamerton)")
     g.add_argument("--model", choices=WHISPER_MODELS, help="Whisper model (default: auto, fits this computer)")
     g.add_argument("--auto-vocabulary", action=argparse.BooleanOptionalAction, default=None,
                    help="add the vocabulary of the detected game (default: on)")
@@ -141,6 +153,7 @@ def settings_from_args(args: argparse.Namespace, base: Optional[Settings] = None
         "hook": "shorts_hook", "publish_kit": "publish_kit", "auto_trim": "auto_trim",
         "auto_vocabulary": "auto_vocabulary", "audio_track": "audio_track",
         "output_audio_track": "output_audio_track",
+        "stt_url": "stt_url", "stt_key": "stt_api_key", "stt_model": "stt_model",
     }
     for arg_name, field_name in mapping.items():
         value = getattr(args, arg_name, None)
@@ -228,6 +241,58 @@ def _launch_gui(path: Optional[str] = None) -> int:
     return gui_main(path)
 
 
+def open_store(config: S3Config) -> S3Store:
+    return S3Store(config)
+
+
+def _watch(args: argparse.Namespace) -> int:
+    """Auto mode: poll S3 until Ctrl+C (or one cycle with --once)."""
+    from . import s3watch
+
+    def log(message: str) -> None:
+        print(message, flush=True)
+
+    try:
+        config = S3Config.from_env(Path(args.env_file).expanduser() if args.env_file else None)
+    except RuntimeError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+    settings = settings_from_args(args, Settings.load(settings_path()))
+    errors = settings.validate()
+    if errors:
+        print("ERROR: invalid settings: " + "; ".join(errors), file=sys.stderr)
+        return 2
+    root = cache_dir() / "s3watch"
+    log(f"Auto mode: {config!r}")
+    log(f"Watching s3://{config.bucket}/{settings.watch_prefix}<streamer>/ every {settings.watch_interval} s, "
+        f"{settings.watch_variants} versions into <streamer>/{settings.watch_subdir}/, "
+        f"speech server {settings.stt_url}.")
+    try:
+        with s3watch.acquire_lock(root / "watch.lock"):
+            watcher = s3watch.Watcher(open_store(config), settings, s3watch.default_render_fn(settings, log),
+                                      root / "work", s3watch.WatchState(root / "state.json"), log,
+                                      speech_check=s3watch.speech_check_for(settings))
+            stop = threading.Event()
+            if args.once:
+                summary = watcher.run_once(stop)
+                log(f"Done: {summary.done} published, {summary.skipped} up to date or parked, "
+                    f"{summary.failed} failed, {summary.pending} waiting.")
+                return 1 if summary.failed else 0
+            worker = threading.Thread(target=watcher.run_forever, args=(stop,), daemon=True)
+            worker.start()
+            try:
+                while worker.is_alive():
+                    worker.join(0.5)
+            except KeyboardInterrupt:
+                log("Stopping after the current clip... (Ctrl+C again to quit now)")
+                stop.set()
+                worker.join()
+            return 0
+    except RuntimeError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
     if not argv or argv == ["--gui"]:
@@ -257,6 +322,9 @@ def main(argv: Optional[List[str]] = None) -> int:
             shown = ",".join(value) if isinstance(value, list) else value
             print(f"{key} = {shown}")
         return 0
+
+    if args.watch:
+        return _watch(args)
 
     from .pipeline import Pipeline, Project
 

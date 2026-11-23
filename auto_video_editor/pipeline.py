@@ -6,9 +6,12 @@ import hashlib
 import json
 import os
 import shutil
+import uuid
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
+
+import numpy as np
 from typing import List, Optional, Tuple
 
 from . import __version__, publish, vision
@@ -23,12 +26,13 @@ from .insights import (VideoInsights, auto_layout, auto_model, auto_shorts_count
                        scan_video, speech_stats)
 from .moments import (Moment, build_curve, compute_hook, compute_keep_ranges, find_candidates, plan_shorts,
                       select_highlight)
-from .render import Renderer, caption_margin, loudnorm_apply_filter
+from .render import SPLIT_TOP_H, Renderer, caption_margin, caption_top_margin, loudnorm_apply_filter
+from .variants import VariantSpec, speed_words
 from .reporting import Reporter
 from .settings import CONTENT_LABELS, Settings, cache_dir
 from .speakers import assign_speakers
 from .timeline import TimeMap, format_clock, format_tag, slugify, total_duration
-from .transcribe import Transcriber, Transcript, load_cached, resolve_backend, save_cached
+from .transcribe import HTTP_BACKEND, SpeechServer, Transcriber, Transcript, load_cached, resolve_backend, save_cached
 
 PROJECT_FILE = "project.json"
 PROJECT_VERSION = 2
@@ -37,11 +41,12 @@ TRANSCRIPT_CACHE_VERSION = "v4"  # bump when transcription parameters change
 # Settings that change which moments are picked. Changing them requires a new analysis.
 ANALYSIS_KEYS = (
     "content_type", "profile", "target_duration", "min_clip", "max_clip", "pad_before", "pad_after",
-    "shorts_count", "shorts_auto", "shorts_min", "shorts_max", "transcriber", "whisper_model", "language",
+    "shorts_count", "shorts_auto", "shorts_min", "shorts_max", "transcriber", "whisper_model", "stt_url", "stt_model", "language",
     "keywords", "auto_keywords", "jump_cuts", "min_silence", "silence_threshold", "context_before", "context_after",
     "diversity", "min_score", "beam_size", "weight_loudness", "weight_spikes", "weight_speech", "weight_keywords",
     "weight_exclamations", "skip_start", "skip_end", "auto_trim", "vocabulary", "vocabulary_packs", "auto_vocabulary",
     "profanity_prompt", "censor_profanity", "censor_words", "diarize", "speaker_count",
+    "whole_clip", "whole_clip_max", "whole_clip_cut",
 )
 
 
@@ -215,13 +220,18 @@ class Pipeline:
                 self.log(f"Recognised from the title: {pack.name} ({pack.category}).")
         speakers = 0
         if backend and info.has_audio:
-            if s.whisper_model == "auto":
+            if backend == HTTP_BACKEND:
+                server = SpeechServer(s.stt_url, s.stt_api_key, s.stt_model)
+                self.log(f"Speech server: {server.describe()} — {server.check()}.")
+            elif s.whisper_model == "auto":
                 s.whisper_model, why = auto_model(info.duration)
                 eta = estimate_transcription(info.duration, s.whisper_model)
                 self.log(f"Speech model: {s.whisper_model} (auto: {why}; first transcription ≈ {format_clock(eta)}).")
                 auto.append(["Speech model", s.whisper_model])
-            transcriber = Transcriber(backend, s.whisper_model, s.language, self.log, r.cancel_event,
+            transcriber = Transcriber(backend, self._model_name(backend, s), s.language, self.log, r.cancel_event,
                                       beam_size=s.beam_size, profanity=s.profanity_prompt)
+            if backend == HTTP_BACKEND:
+                transcriber.server = server
             transcriber.audio_track, transcriber.track_count = self._track(info, "audio_track"), info.track_count
             sample = ""
             if not s.language or (s.auto_vocabulary and not any(p.is_game for p in chosen + detected)):
@@ -296,9 +306,10 @@ class Pipeline:
         min_clip = min(s.min_clip, max(2.0, info.duration / 4))
         max_clip = max(min_clip, s.max_clip)
         limit = max(40, int(s.target_for(info.duration) / min_clip * 3) + 30)
-        candidates = find_candidates(curve, env, transcript, info.duration, min_clip, max_clip, limit,
-                                     lead=s.context_before, tail=s.context_after)
-        if not candidates:
+        whole = s.whole_clip and info.duration <= s.whole_clip_max
+        candidates = [] if whole else find_candidates(curve, env, transcript, info.duration, min_clip, max_clip,
+                                                      limit, lead=s.context_before, tail=s.context_after)
+        if not candidates and not s.whole_clip:
             raise RuntimeError("No usable moments were found. Is the audio track silent?")
         weak = [c for c in candidates if c.score < s.min_score]
         if weak and len(weak) < len(candidates):
@@ -308,12 +319,14 @@ class Pipeline:
         else:
             self.log(f"Found {len(candidates)} candidate moments.")
 
-        if s.profile == "auto" and s.target_duration <= 0:
+        if s.whole_clip:
+            s.shorts_auto, s.shorts_count = False, 1
+        elif s.profile == "auto" and s.target_duration <= 0:
             s.target_duration = round(auto_target(candidates, info.duration, s.min_score), 1)
             self.log(f"Reel length: {format_clock(s.target_duration)} (auto: follows the number of great moments).")
             auto.append(["Reel length", format_clock(s.target_duration)])
         target = s.target_for(info.duration)
-        if s.shorts_auto:
+        if s.shorts_auto and not s.whole_clip:
             s.shorts_count = auto_shorts_count(candidates, info.duration)
             self.log(f"Shorts: {s.shorts_count} (auto: one per great moment).")
             auto.append(["Shorts", str(s.shorts_count)])
@@ -337,10 +350,24 @@ class Pipeline:
             # Pick moments by their length after dead air is removed, so the reel hits the target.
             for candidate in candidates:
                 self._attach_details(candidate, env, transcript)
-        highlight = select_highlight(candidates, target, info.duration, s.pad_before, s.pad_after,
-                                     jump_cuts=s.jump_cuts, diversity=s.diversity)
-        shorts = []
-        if s.shorts_count > 0:
+        if s.whole_clip:
+            highlight = []
+            if whole:
+                shorts = [self._whole_clip_moment(transcript, info.duration, curve)]
+                self.log(f"Whole clip: one vertical short of {format_clock(shorts[0].duration)} before cuts.")
+            else:
+                shorts = plan_shorts(candidates, curve, transcript, env, info.duration, 1, min(20.0, s.whole_clip_cut),
+                                     s.whole_clip_cut, s.pad_before, s.pad_after) if candidates else []
+                if not shorts:  # no peak at all: the clip was still chosen by a person, keep its start
+                    shorts = [Moment(start=0.0, end=min(info.duration, s.whole_clip_cut), score=50.0,
+                                     peak=min(info.duration, s.whole_clip_cut) / 2, reasons=["clip start"])]
+                self.log(f"Clip longer than {format_clock(s.whole_clip_max)}: best fragment of at most "
+                         f"{format_clock(s.whole_clip_cut)} kept.")
+        else:
+            highlight = select_highlight(candidates, target, info.duration, s.pad_before, s.pad_after,
+                                         jump_cuts=s.jump_cuts, diversity=s.diversity)
+            shorts = []
+        if s.shorts_count > 0 and not s.whole_clip:
             shorts = plan_shorts(candidates, curve, transcript, env, info.duration, s.shorts_count,
                                  s.shorts_min, s.shorts_max, s.pad_before, s.pad_after)
         for moment in highlight:
@@ -452,9 +479,26 @@ class Pipeline:
         threshold = self.settings.silence_threshold if self.settings.silence_threshold < 0 else None
         keep = compute_keep_ranges(moment.start, moment.end, env, moment.words, self.settings.min_silence,
                                    threshold)
-        if is_short and total_duration(keep) < min(self.settings.shorts_min, moment.duration):
-            return []  # jump cuts must not shrink a short below its minimum length
+        # Jump cuts must not shrink a short below its minimum length. A whole clip keeps its cuts: pauses
+        # are what loses a TikTok viewer, only a nearly empty result falls back to the uncut clip.
+        minimum = 5.0 if self.settings.whole_clip else self.settings.shorts_min
+        if is_short and total_duration(keep) < min(minimum, moment.duration):
+            return []
         return keep
+
+    @staticmethod
+    def _whole_clip_moment(transcript: Optional[Transcript], duration: float, curve=None) -> Moment:
+        words = list(transcript.words()) if transcript is not None else []
+        start, end = 0.0, duration
+        if words:
+            start = max(0.0, words[0].start - 0.3)
+            end = min(duration, words[-1].end + 0.5)
+        peak = (start + end) / 2
+        if curve is not None and len(curve.score):
+            a, b = int(start), min(len(curve.score), int(end) + 1)
+            if b > a:  # the best second of the clip: the hook of a version opens on it
+                peak = min(end, a + int(np.argmax(curve.score[a:b])) + 0.5)
+        return Moment(start=start, end=end, score=100.0, peak=peak, reasons=["whole clip"])
 
     def _cache_file(self, kind: str, name: str) -> Path:
         return cache_dir() / kind / name
@@ -481,8 +525,12 @@ class Pipeline:
                 self._envelope = AudioEnvelope.load(path)
                 self.log("Audio analysis: loaded from cache.")
                 return self._envelope
-            except (OSError, ValueError, KeyError):
-                pass
+            except (OSError, ValueError) as exc:
+                self.log(f"Audio analysis cache unreadable ({exc}), analyzing again.")
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
         self.log("Analyzing audio levels...")
         env = analyze_audio(info, r.stage("audio", "Analyzing audio"), r.cancel_event,
                             track=self._track(info, "audio_track"))
@@ -493,13 +541,20 @@ class Pipeline:
         self._envelope = env
         return env
 
+    @staticmethod
+    def _model_name(backend: str, s: Settings) -> str:
+        return (s.stt_model or "default") if backend == HTTP_BACKEND else s.whisper_model
+
     def _load_transcript(self, info: MediaInfo, backend: str, s: Settings,
                          transcriber: Transcriber) -> Transcript:
         r = self.reporter
         language = s.language.strip().lower() or "auto"
         context = hashlib.sha1(json.dumps([sorted(s.vocabulary), s.profanity_prompt]).encode("utf-8")).hexdigest()[:8]
         track = transcriber.audio_track
-        path = self._cache_file("transcripts", f"{media_fingerprint(info.path)}-{backend}-{s.whisper_model}-"
+        model = self._model_name(backend, s)
+        if backend == HTTP_BACKEND:  # another server or model gives another transcript
+            model = hashlib.sha1(f"{SpeechServer(s.stt_url).url}|{model}".encode("utf-8")).hexdigest()[:8]
+        path = self._cache_file("transcripts", f"{media_fingerprint(info.path)}-{backend}-{model}-"
                                                f"{language}{'' if s.beam_size == 5 else f'-b{s.beam_size}'}-"
                                                f"{'' if track == 1 else f't{track}-'}"
                                                f"{context}-{TRANSCRIPT_CACHE_VERSION}.json")
@@ -508,7 +563,7 @@ class Pipeline:
             if cached is not None:
                 self.log(f"Transcript: loaded from cache ({len(cached.segments)} sentences).")
                 return cached
-        self.log(f"Transcribing speech with {backend} ({s.whisper_model}). This is the longest step.")
+        self.log(f"Transcribing speech with {backend} ({self._model_name(backend, s)}). This is the longest step.")
         if s.vocabulary:
             self.log(f"Vocabulary hints: {', '.join(s.vocabulary[:12])}{'…' if len(s.vocabulary) > 12 else ''}")
         transcriber.language = s.language.strip() or None
@@ -711,6 +766,96 @@ class Pipeline:
                 "score": m.score, "reasons": ", ".join(m.reasons), "text": m.text,
             })
 
+    def _render_one_short(self, project: Project, m: Moment, path: Path, renderer: Renderer, work: Path,
+                          ranges: list, captions_name: str, layout: str, facecam, adaptive: bool,
+                          on_progress=None, speed: float = 1.0, **render_options) -> Tuple[str, Optional[float], list]:
+        """Render one vertical short; returns the layout used, the face position and the caption words."""
+        s, info = self.settings, project.media
+        short_layout, subject_x = layout, None
+        if vision.available() and (layout == "smart" or (layout == "split" and adaptive)):
+            try:
+                subject_x, big_faces = vision.analyse_window(info, m.start, m.duration)
+            except Exception as exc:  # face detection is a nice-to-have, never fatal
+                subject_x, big_faces = None, 0.0
+                self.log(f"  face detection failed ({exc})")
+            if layout == "split" and big_faces >= 0.5:
+                short_layout = "smart"
+                self.log("  full-screen camera in this moment: face tracking instead of the split layout")
+            if short_layout == "smart":
+                self.log("  face detected, crop follows the speaker" if subject_x is not None
+                         else "  no face detected, using a centered crop")
+
+        captions_file = None
+        timed_words = remap_words_sequence(m.words, ranges) if m.words else []
+        if s.captions and timed_words:
+            captions_file = captions_name
+            ass = build_ass(speed_words(timed_words, speed), style=s.caption_style,
+                            margin_v=caption_margin(short_layout, info),
+                            font=s.caption_font, size_scale=s.caption_size / 100.0,
+                            uppercase=s.caption_uppercase, highlight=s.caption_color,
+                            max_words=s.caption_words, position=s.caption_position,
+                            speaker_colors=s.caption_speaker_colors,
+                            top_margin=caption_top_margin(short_layout, render_options.get("split_top", SPLIT_TOP_H)))
+            (work / captions_file).write_text(ass, encoding="utf-8")
+
+        audio_filter = None
+        if s.normalize_audio:
+            measured = renderer.measure_segment_loudness(ranges, s.target_lufs)
+            audio_filter = loudnorm_apply_filter(measured, s.target_lufs)
+
+        renderer.render_segment(
+            ranges, path, layout=short_layout, subject_x=subject_x, facecam=facecam,
+            captions_file=captions_file, audio_filter=audio_filter, cwd=str(work), on_progress=on_progress,
+            speed=speed, **render_options,
+        )
+        return short_layout, subject_x, timed_words
+
+    def render_variant(self, project: Project, spec: VariantSpec, output: Path) -> Tuple[Path, bool]:
+        """Render ``project.shorts[0]`` as one TikTok version; returns the file and whether captions were burned."""
+        user = self.settings
+        s = project.effective_settings(user)
+        if s.shorts_layout == "auto":
+            s.shorts_layout = "blur"
+        s.caption_style, s.caption_color, s.caption_position = spec.caption_style, spec.caption_color, spec.caption_position
+        s.shorts_hook, s.quality = spec.hook, spec.quality
+        self.settings = s
+        output = Path(output)
+        work = output.parent / f".work-{output.stem}"
+        try:
+            require_tools()
+            info = project.media
+            if not os.path.isfile(info.path):
+                raise FileNotFoundError(f"Source video not found: {info.path}")
+            if not project.shorts:
+                raise ValueError("Nothing to render: the project has no short.")
+            m = project.shorts[0]
+            env = self._envelope or self._cached_envelope(info)
+            if env is not None:
+                m.keep = self._jump_cut_ranges(m, env, is_short=True)
+            ranges = m.ranges(s.shorts_jump_cuts)
+            if s.shorts_hook and m.hook:
+                ranges = list(m.hook) + ranges
+            facecam = s.facecam_rect() if s.facecam.strip() else None
+            layout = spec.layout if (spec.layout != "split" or facecam) else "blur"
+            output.parent.mkdir(parents=True, exist_ok=True)
+            work.mkdir(parents=True, exist_ok=True)
+            renderer = Renderer(info, pick_encoder(s.encoder), spec.quality, self.reporter.cancel_event,
+                                audio_bitrate=s.audio_bitrate, blur=s.blur_strength,
+                                audio_track=self._track(info, "output_audio_track"))
+            stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+            extra = ["-g", str(spec.gop), "-map_metadata", "-1", "-metadata", f"comment={uuid.uuid4().hex}",
+                     "-metadata", f"creation_time={stamp}"]
+            self.log(f"Version {spec.index}: {layout} layout, {spec.caption_style} captions {spec.caption_position}"
+                     f"{', hook' if s.shorts_hook and m.hook else ''}, speed {spec.speed:g}, zoom {spec.zoom:g}.")
+            _layout, _x, words = self._render_one_short(
+                project, m, output, renderer, work, ranges, f"v{spec.index}.ass", layout, facecam, adaptive=False,
+                speed=spec.speed, game_zoom=spec.zoom, game_shift=spec.shift, split_top=spec.split_top,
+                video_effects=spec.effects, extra_output_args=extra)
+            return output, bool(words) and s.captions
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
+            self.settings = user
+
     def _render_shorts(self, project: Project, moments: List[Moment], renderer: Renderer, out: Path,
                        work: Path, result: RenderResult, rows: List[dict]) -> None:
         s, r, info = self.settings, self.reporter, project.media
@@ -747,41 +892,9 @@ class Pipeline:
             self.log(f"Short {i}/{len(moments)}: {format_clock(m.start, True)} ({length:.1f}s{hook_note}, "
                      f"score {m.score:.0f}) \"{title}\"")
 
-            short_layout, subject_x = layout, None
-            if vision.available() and (layout == "smart" or (layout == "split" and adaptive)):
-                try:
-                    subject_x, big_faces = vision.analyse_window(info, m.start, m.duration)
-                except Exception as exc:  # face detection is a nice-to-have, never fatal
-                    subject_x, big_faces = None, 0.0
-                    self.log(f"  face detection failed ({exc})")
-                if layout == "split" and big_faces >= 0.5:
-                    short_layout = "smart"
-                    self.log("  full-screen camera in this moment: face tracking instead of the split layout")
-                if short_layout == "smart":
-                    self.log("  face detected, crop follows the speaker" if subject_x is not None
-                             else "  no face detected, using a centered crop")
-
-            captions_file = None
-            timed_words = remap_words_sequence(m.words, ranges) if m.words else []
-            if s.captions and timed_words:
-                captions_file = f"short_{i:02d}.ass"
-                ass = build_ass(timed_words, style=s.caption_style, margin_v=caption_margin(short_layout, info),
-                                font=s.caption_font, size_scale=s.caption_size / 100.0,
-                                uppercase=s.caption_uppercase, highlight=s.caption_color,
-                                max_words=s.caption_words, position=s.caption_position,
-                                speaker_colors=s.caption_speaker_colors)
-                (work / captions_file).write_text(ass, encoding="utf-8")
-
-            audio_filter = None
-            if s.normalize_audio:
-                measured = renderer.measure_segment_loudness(ranges, s.target_lufs)
-                audio_filter = loudnorm_apply_filter(measured, s.target_lufs)
-
-            renderer.render_segment(
-                ranges, path, layout=short_layout, subject_x=subject_x, facecam=facecam,
-                captions_file=captions_file, audio_filter=audio_filter, cwd=str(work),
-                on_progress=lambda p, base=done, length=length: progress((base + p * length) / total),
-            )
+            short_layout, subject_x, timed_words = self._render_one_short(
+                project, m, path, renderer, work, ranges, f"short_{i:02d}.ass", layout, facecam, adaptive,
+                on_progress=lambda p, base=done, length=length: progress((base + p * length) / total))
             result.shorts.append(path)
             if s.export_srt and timed_words:
                 path.with_suffix(".srt").write_text(build_srt(timed_words), encoding="utf-8")

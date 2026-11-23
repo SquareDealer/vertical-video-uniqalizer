@@ -7,3 +7,5 @@ tkinterdnd2>=0.4       # drag & drop (optional)
 faster-whisper>=1.0
 # Face tracking for the "smart" vertical crop (optional).
 opencv-python-headless>=4.8,<5
+# Auto mode: poll an S3 bucket for new clips (optional).
+boto3>=1.34

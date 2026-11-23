@@ -71,3 +71,22 @@ def test_scan_video(sample_video):
     insights = scan_video(probe(str(sample_video)), motion_samples=6, face_samples=6)
     assert insights.motion > 0, "testsrc2 moves"
     assert insights.facecam is None
+
+
+def test_damaged_audio_cache_is_rebuilt(sample_video, tmp_path, monkeypatch):
+    """A cache file cut short (crash while writing) must not stop the analysis."""
+    monkeypatch.setattr("auto_video_editor.pipeline.cache_dir", lambda: tmp_path / "cache")
+    monkeypatch.setattr("auto_video_editor.settings.cache_dir", lambda: tmp_path / "cache")
+    settings = Settings(transcriber="none", use_cache=True)
+    logs = []
+    pipeline = Pipeline(str(sample_video), settings, str(tmp_path / "out"), Reporter(logs.append, lambda *_: None))
+    info = probe(str(sample_video))
+    first = pipeline._load_envelope(info)
+    path = pipeline._envelope_path(info)
+    path.write_bytes(path.read_bytes()[:200])  # keep the zip header, lose the rest
+
+    rebuilt = pipeline._load_envelope(info)
+    assert any("cache unreadable" in line for line in logs)
+    assert rebuilt.rms_db.shape == first.rms_db.shape
+    assert pipeline._load_envelope(info).rms_db.shape == first.rms_db.shape, "the rebuilt cache is readable"
+    assert not list(path.parent.glob("*.tmp.npz")), "no temporary file is left behind"
