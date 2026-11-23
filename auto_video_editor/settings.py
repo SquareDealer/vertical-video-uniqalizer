@@ -19,7 +19,7 @@ PROFILES = {
 
 PROFILE_CHOICES = ("auto",) + tuple(PROFILES)
 SHORTS_LAYOUTS = ("auto", "blur", "crop", "smart", "split")
-TRANSCRIBERS = ("auto", "faster-whisper", "openai-whisper", "none")
+TRANSCRIBERS = ("auto", "faster-whisper", "openai-whisper", "http", "none")
 WHISPER_MODELS = ("auto", "tiny", "base", "small", "medium", "large-v3", "turbo")
 TRANSITIONS = ("cut", "fade")
 QUALITIES = ("draft", "standard", "high")
@@ -126,6 +126,10 @@ class Settings:
     audio_track: int = 1            # audio track listened to (multi-track OBS recordings); 0 = all tracks mixed
     transcriber: str = "auto"
     whisper_model: str = "auto"
+    # "http" transcriber: an OpenAI-compatible speech server such as Kamerton (github.com/mazixs/kamerton)
+    stt_url: str = "http://localhost:8091/v1"
+    stt_api_key: str = ""
+    stt_model: str = "kamerton"
     language: str = ""  # empty = auto-detect
     beam_size: int = 5
     vocabulary: List[str] = field(default_factory=list)  # names/jargon the transcriber should know

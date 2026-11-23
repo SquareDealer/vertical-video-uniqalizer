@@ -26,7 +26,7 @@ really starts and ends. Every automatic choice is shown and can be overridden.
 | Setting | How it is decided |
 |---------|-------------------|
 | Content style | Game recognised, webcam overlay, speech coverage, background audio, faces and motion → *gaming*, *talk* or *vlog* preset |
-| Speech model | NVIDIA GPU → `large-v3`, Apple Silicon / 8+ cores → `small`, otherwise `base` (lighter for very long recordings) |
+| Speech model | NVIDIA GPU (with CUDA libraries) → `large-v3`, Apple Silicon / 8+ cores → `small`, otherwise `base` (lighter for very long recordings) |
 | Language | Voted on three samples spread over the recording |
 | Vocabulary | One game and one topic recognised among 100+ packs from the title, the metadata or a speech sample → their names and jargon are given to the transcriber |
 | Hype phrases | Built-in phrases for the detected language, plus laughter detection |
@@ -290,6 +290,43 @@ Never more than half of the source. Use `--target` (or *Exact length*) to set it
   or `~/.cache/auto-video-editor` (Linux). Delete the folder to reclaim space.
 
 ---
+
+## Speech recognition on a server (Kamerton)
+
+Instead of running Whisper inside the app, the transcription can be sent over HTTP to any
+**OpenAI-compatible speech server** (`POST /v1/audio/transcriptions` with `verbose_json` and word
+timestamps). It is built for [Kamerton](https://github.com/mazixs/kamerton): GigaAM v3, very accurate
+Russian, CPU only, about 20x faster than real time.
+
+**1. Deploy Kamerton locally** (Docker Desktop must be running):
+
+```bash
+git clone https://github.com/mazixs/kamerton.git
+cd kamerton
+docker compose up -d --build
+```
+
+Open `http://localhost:8091`, go to **Models** and deploy `e2e_rnnt` (best for Russian, ~220 MB
+downloaded once). Or from the command line:
+
+```bash
+curl -X POST http://localhost:8091/api/deploy -H "Content-Type: application/json" -d '{"variant":"e2e_rnnt"}'
+```
+
+**2. Connect the editor.** In the app: *Detection > Speech recognition > Engine* = **Speech server**,
+address `http://localhost:8091/v1`, then *Test*. From the command line:
+
+```bash
+python main.py stream.mp4 --transcriber http
+python main.py stream.mp4 --transcriber http --stt-url http://192.168.1.10:8091/v1 --stt-key MY_KEY
+```
+
+The audio is sent in 10-minute 16 kHz WAV windows. Notes:
+
+- GigaAM speaks Russian only (`ml_ctc` / `ml_ctc_large` add English, Kazakh, Kyrgyz and Uzbek). The language
+  is not reported by the server, so set *Spoken language* or let the app guess it from the script.
+- Vocabulary hints are not sent: Kamerton has its own glossary, edited in its web console.
+- If you set `API_KEY` in Kamerton's `.env`, put the same key in *Speech server API key* (`--stt-key`).
 
 ## Custom vocabulary packs
 

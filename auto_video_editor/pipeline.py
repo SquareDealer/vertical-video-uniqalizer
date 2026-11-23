@@ -28,7 +28,7 @@ from .reporting import Reporter
 from .settings import CONTENT_LABELS, Settings, cache_dir
 from .speakers import assign_speakers
 from .timeline import TimeMap, format_clock, format_tag, slugify, total_duration
-from .transcribe import Transcriber, Transcript, load_cached, resolve_backend, save_cached
+from .transcribe import HTTP_BACKEND, SpeechServer, Transcriber, Transcript, load_cached, resolve_backend, save_cached
 
 PROJECT_FILE = "project.json"
 PROJECT_VERSION = 2
@@ -37,7 +37,7 @@ TRANSCRIPT_CACHE_VERSION = "v4"  # bump when transcription parameters change
 # Settings that change which moments are picked. Changing them requires a new analysis.
 ANALYSIS_KEYS = (
     "content_type", "profile", "target_duration", "min_clip", "max_clip", "pad_before", "pad_after",
-    "shorts_count", "shorts_auto", "shorts_min", "shorts_max", "transcriber", "whisper_model", "language",
+    "shorts_count", "shorts_auto", "shorts_min", "shorts_max", "transcriber", "whisper_model", "stt_url", "stt_model", "language",
     "keywords", "auto_keywords", "jump_cuts", "min_silence", "silence_threshold", "context_before", "context_after",
     "diversity", "min_score", "beam_size", "weight_loudness", "weight_spikes", "weight_speech", "weight_keywords",
     "weight_exclamations", "skip_start", "skip_end", "auto_trim", "vocabulary", "vocabulary_packs", "auto_vocabulary",
@@ -215,13 +215,18 @@ class Pipeline:
                 self.log(f"Recognised from the title: {pack.name} ({pack.category}).")
         speakers = 0
         if backend and info.has_audio:
-            if s.whisper_model == "auto":
+            if backend == HTTP_BACKEND:
+                server = SpeechServer(s.stt_url, s.stt_api_key, s.stt_model)
+                self.log(f"Speech server: {server.describe()} — {server.check()}.")
+            elif s.whisper_model == "auto":
                 s.whisper_model, why = auto_model(info.duration)
                 eta = estimate_transcription(info.duration, s.whisper_model)
                 self.log(f"Speech model: {s.whisper_model} (auto: {why}; first transcription ≈ {format_clock(eta)}).")
                 auto.append(["Speech model", s.whisper_model])
-            transcriber = Transcriber(backend, s.whisper_model, s.language, self.log, r.cancel_event,
+            transcriber = Transcriber(backend, self._model_name(backend, s), s.language, self.log, r.cancel_event,
                                       beam_size=s.beam_size, profanity=s.profanity_prompt)
+            if backend == HTTP_BACKEND:
+                transcriber.server = server
             transcriber.audio_track, transcriber.track_count = self._track(info, "audio_track"), info.track_count
             sample = ""
             if not s.language or (s.auto_vocabulary and not any(p.is_game for p in chosen + detected)):
@@ -481,8 +486,12 @@ class Pipeline:
                 self._envelope = AudioEnvelope.load(path)
                 self.log("Audio analysis: loaded from cache.")
                 return self._envelope
-            except (OSError, ValueError, KeyError):
-                pass
+            except (OSError, ValueError) as exc:
+                self.log(f"Audio analysis cache unreadable ({exc}), analyzing again.")
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
         self.log("Analyzing audio levels...")
         env = analyze_audio(info, r.stage("audio", "Analyzing audio"), r.cancel_event,
                             track=self._track(info, "audio_track"))
@@ -493,13 +502,20 @@ class Pipeline:
         self._envelope = env
         return env
 
+    @staticmethod
+    def _model_name(backend: str, s: Settings) -> str:
+        return (s.stt_model or "default") if backend == HTTP_BACKEND else s.whisper_model
+
     def _load_transcript(self, info: MediaInfo, backend: str, s: Settings,
                          transcriber: Transcriber) -> Transcript:
         r = self.reporter
         language = s.language.strip().lower() or "auto"
         context = hashlib.sha1(json.dumps([sorted(s.vocabulary), s.profanity_prompt]).encode("utf-8")).hexdigest()[:8]
         track = transcriber.audio_track
-        path = self._cache_file("transcripts", f"{media_fingerprint(info.path)}-{backend}-{s.whisper_model}-"
+        model = self._model_name(backend, s)
+        if backend == HTTP_BACKEND:  # another server or model gives another transcript
+            model = hashlib.sha1(f"{SpeechServer(s.stt_url).url}|{model}".encode("utf-8")).hexdigest()[:8]
+        path = self._cache_file("transcripts", f"{media_fingerprint(info.path)}-{backend}-{model}-"
                                                f"{language}{'' if s.beam_size == 5 else f'-b{s.beam_size}'}-"
                                                f"{'' if track == 1 else f't{track}-'}"
                                                f"{context}-{TRANSCRIPT_CACHE_VERSION}.json")
@@ -508,7 +524,7 @@ class Pipeline:
             if cached is not None:
                 self.log(f"Transcript: loaded from cache ({len(cached.segments)} sentences).")
                 return cached
-        self.log(f"Transcribing speech with {backend} ({s.whisper_model}). This is the longest step.")
+        self.log(f"Transcribing speech with {backend} ({self._model_name(backend, s)}). This is the longest step.")
         if s.vocabulary:
             self.log(f"Vocabulary hints: {', '.join(s.vocabulary[:12])}{'…' if len(s.vocabulary) > 12 else ''}")
         transcriber.language = s.language.strip() or None

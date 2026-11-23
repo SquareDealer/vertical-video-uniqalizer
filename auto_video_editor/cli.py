@@ -92,6 +92,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="audio track to analyze in a multi-track recording, e.g. 2 for an OBS mic track "
                         "(default: 1)")
     g.add_argument("--transcriber", choices=TRANSCRIBERS, help="speech-to-text engine (default: auto)")
+    g.add_argument("--stt-url", help="address of an OpenAI-compatible speech server for --transcriber http "
+                                     "(default: http://localhost:8091/v1, a local Kamerton)")
+    g.add_argument("--stt-key", help="API key of the speech server (default: none)")
+    g.add_argument("--stt-model", help="model name sent to the speech server (default: kamerton)")
     g.add_argument("--model", choices=WHISPER_MODELS, help="Whisper model (default: auto, fits this computer)")
     g.add_argument("--auto-vocabulary", action=argparse.BooleanOptionalAction, default=None,
                    help="add the vocabulary of the detected game (default: on)")
@@ -141,6 +145,7 @@ def settings_from_args(args: argparse.Namespace, base: Optional[Settings] = None
         "hook": "shorts_hook", "publish_kit": "publish_kit", "auto_trim": "auto_trim",
         "auto_vocabulary": "auto_vocabulary", "audio_track": "audio_track",
         "output_audio_track": "output_audio_track",
+        "stt_url": "stt_url", "stt_key": "stt_api_key", "stt_model": "stt_model",
     }
     for arg_name, field_name in mapping.items():
         value = getattr(args, arg_name, None)

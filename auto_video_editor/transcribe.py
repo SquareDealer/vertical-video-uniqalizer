@@ -6,6 +6,7 @@ import importlib.util
 import json
 import os
 import threading
+from functools import lru_cache
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, Iterator, List, Optional, Sequence, Tuple
@@ -19,6 +20,39 @@ from .speakers import voice_features
 
 CHUNK_SECONDS = 600.0   # transcribe long recordings in 10 minute windows
 OVERLAP_SECONDS = 30.0  # extra audio so sentences at a window edge are not cut
+
+
+
+# CUDA runtime libraries CTranslate2 loads on Windows; without them GPU inference fails or hangs.
+_WINDOWS_CUDA_DLLS = ("cublas64_12.dll", "cudnn64_9.dll")
+
+
+@lru_cache(maxsize=1)
+def cuda_compute_type() -> Optional[str]:
+    """Best compute type for faster-whisper on the GPU, or None when the GPU cannot be used.
+
+    Older cards (Pascal, e.g. GTX 10xx) have no efficient float16, so ``int8`` is used there.
+    """
+    try:
+        import ctranslate2
+
+        if ctranslate2.get_cuda_device_count() <= 0:
+            return None
+        supported = set(ctranslate2.get_supported_compute_types("cuda"))
+    except Exception:  # noqa: BLE001
+        return None
+    if os.name == "nt":
+        import ctypes
+
+        for dll in _WINDOWS_CUDA_DLLS:
+            try:
+                ctypes.WinDLL(dll)
+            except OSError:
+                return None
+    for compute_type in ("float16", "int8_float16", "int8"):
+        if compute_type in supported:
+            return compute_type
+    return None
 
 
 @dataclass
@@ -164,6 +198,8 @@ def resolve_backend(preference: str) -> Optional[str]:
     """Return the backend to use, or ``None`` when transcription is disabled/unavailable."""
     if preference == "none":
         return None
+    if preference == HTTP_BACKEND:
+        return HTTP_BACKEND
     available = available_backends()
     if preference == "auto":
         return available[0] if available else None
@@ -187,25 +223,30 @@ class Transcriber:
         self.log = log
         self.cancel_event = cancel_event or threading.Event()
         self.audio_track, self.track_count = 1, 1  # track to listen to (1-based, 0 = all mixed)
+        self.server: Optional[SpeechServer] = None  # set for the "http" backend
         self._model = None
 
     # -- model loading --------------------------------------------------------------------
     def _load(self) -> None:
         if self._model is not None:
             return
-        self.log(f"Loading the '{self.model_name}' speech model ({self.backend}). "
-                 "The first run downloads it, please be patient...")
+        if self.backend != HTTP_BACKEND:
+            self.log(f"Loading the '{self.model_name}' speech model ({self.backend}). "
+                     "The first run downloads it, please be patient...")
+        if self.backend == HTTP_BACKEND:
+            if self.server is None:
+                raise RuntimeError("The http transcriber needs a server address (stt_url).")
+            self._model = self.server
+            self.log(f"Speech recognition server: {self.server.describe()}")
+            return
         if self.backend == "faster-whisper":
             from faster_whisper import WhisperModel
 
             device, compute_type = "cpu", "int8"
-            try:
-                import ctranslate2
-
-                if ctranslate2.get_cuda_device_count() > 0:
-                    device, compute_type = "cuda", "float16"
-            except Exception:
-                pass
+            gpu_type = cuda_compute_type()
+            if gpu_type:
+                device, compute_type = "cuda", gpu_type
+            self.log(f"Speech model runs on {device.upper()} ({compute_type}).")
             threads = max(1, (os.cpu_count() or 2) - 1)
             self._model = WhisperModel(self.model_name, device=device, compute_type=compute_type,
                                        cpu_threads=threads)
@@ -266,6 +307,13 @@ class Transcriber:
                           on_progress: Callable[[float], None]):
         if audio.size < SAMPLE_RATE // 2:
             return [], None
+        if self.backend == HTTP_BACKEND:
+            self._check_cancel()
+            result, detected = self.server.transcribe(audio, language, words=True)
+            self._check_cancel()
+            if result:
+                on_progress(result[-1].end)
+            return result, detected
         prompt = build_prompt(language, self.vocabulary, self.profanity)
         if self.backend == "faster-whisper":
             # No VAD: Silero drops real speech over game audio/music. Hallucinations in
@@ -335,6 +383,9 @@ class Transcriber:
         return (max(votes, key=votes.get) if votes else None), " ".join(texts)
 
     def _quick_transcribe(self, audio: np.ndarray) -> Tuple[str, Optional[str], float]:
+        if self.backend == HTTP_BACKEND:
+            segments, language = self.server.transcribe(audio, self.language, words=False)
+            return " ".join(seg.text for seg in segments).strip(), language, 1.0
         if self.backend == "faster-whisper":
             segments, info = self._model.transcribe(audio, language=self.language, beam_size=1, vad_filter=False,
                                                     condition_on_previous_text=False, without_timestamps=True)
@@ -354,6 +405,8 @@ class Transcriber:
         if audio.size < SAMPLE_RATE:
             return None
         try:
+            if self.backend == HTTP_BACKEND:
+                return self._quick_transcribe(audio)[1]
             if self.backend == "faster-whisper":
                 detect = getattr(self._model, "detect_language", None)
                 if detect is not None:
@@ -377,6 +430,237 @@ class Transcriber:
     def _check_cancel(self) -> None:
         if self.cancel_event.is_set():
             raise Cancelled("Cancelled by user")
+
+
+# -- remote speech server ----------------------------------------------------------------------
+
+HTTP_BACKEND = "http"
+HTTP_TIMEOUT = 900.0  # one 10 minute window on a slow CPU server
+
+
+@dataclass
+class SpeechServer:
+    """An OpenAI-compatible speech-to-text server (``POST {url}/audio/transcriptions``), e.g. Kamerton.
+
+    The audio is sent as 16 kHz mono WAV, one transcription window at a time, and the answer is read
+    as ``verbose_json`` with word timestamps.
+    """
+
+    url: str = "http://localhost:8091/v1"
+    api_key: str = ""
+    model: str = "kamerton"
+    timeout: float = HTTP_TIMEOUT
+
+    def __post_init__(self) -> None:
+        url = (self.url or "").strip().rstrip("/")
+        if url and "://" not in url:
+            url = "http://" + url
+        if url.endswith("/audio/transcriptions"):
+            url = url[: -len("/audio/transcriptions")]
+        if url and not url.endswith("/v1"):
+            url += "/v1"
+        self.url = url
+
+    def describe(self) -> str:
+        return f"{self.url} (model {self.model or 'default'})"
+
+    def _headers(self) -> Dict[str, str]:
+        headers = {"Accept": "application/json", "User-Agent": "auto-video-editor"}
+        if self.api_key.strip():
+            headers["Authorization"] = f"Bearer {self.api_key.strip()}"
+        return headers
+
+    def _request(self, path: str, data: Optional[bytes] = None,
+                 content_type: Optional[str] = None, timeout: Optional[float] = None) -> dict:
+        import urllib.error
+        import urllib.request
+
+        headers = self._headers()
+        if content_type:
+            headers["Content-Type"] = content_type
+        request = urllib.request.Request(self.url + path, data=data, headers=headers,
+                                         method="POST" if data is not None else "GET")
+        try:
+            with urllib.request.urlopen(request, timeout=timeout or self.timeout) as response:
+                body = response.read()
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", "replace")[:500]
+            try:
+                parsed = json.loads(detail)
+                error = parsed.get("error", parsed)
+                detail = error.get("message", detail) if isinstance(error, dict) else str(error)
+            except ValueError:
+                pass
+            hint = " Check the API key." if exc.code in (401, 403) else ""
+            raise RuntimeError(f"Speech server error {exc.code} at {self.url}{path}: {detail}{hint}") from exc
+        except (urllib.error.URLError, OSError) as exc:
+            reason = getattr(exc, "reason", exc)
+            raise RuntimeError(f"Cannot reach the speech server at {self.url} ({reason}). "
+                               "Is it running? For Kamerton: docker compose up -d in its folder.") from exc
+        try:
+            return json.loads(body.decode("utf-8"))
+        except ValueError as exc:
+            raise RuntimeError(f"The speech server at {self.url} did not answer with JSON.") from exc
+
+    def check(self) -> str:
+        """Ping ``GET /models``; returns a short description of what the server serves."""
+        data = self._request("/models", timeout=10)
+        models = data.get("data") or []
+        if not models:
+            return "reachable"
+        first = models[0]
+        parts = [str(first.get("id", "?"))]
+        if first.get("variant"):
+            parts.append(f"variant {first['variant']}")
+        if first.get("deployed") is False:
+            parts.append("no model deployed yet")
+        return ", ".join(parts)
+
+    def transcribe(self, audio: np.ndarray, language: Optional[str],
+                   words: bool = True) -> Tuple[List[Segment], Optional[str]]:
+        fields: List[Tuple[str, str]] = [("model", self.model or "whisper-1"),
+                                         ("response_format", "verbose_json")]
+        if words:
+            fields += [("timestamp_granularities[]", "word"), ("timestamp_granularities[]", "segment")]
+        if language:
+            fields.append(("language", language))
+        body, content_type = _multipart(fields, "audio.wav", _wav_bytes(audio))
+        data = self._request("/audio/transcriptions", body, content_type)
+        segments = _segments_from_response(data, len(audio) / SAMPLE_RATE)
+        detected = _language_code(data.get("language")) or language or _guess_language(
+            " ".join(seg.text for seg in segments))
+        return segments, detected
+
+
+def _wav_bytes(audio: np.ndarray) -> bytes:
+    import io
+    import wave
+
+    pcm = (np.clip(audio, -1.0, 1.0) * 32767.0).astype("<i2").tobytes()
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as out:
+        out.setnchannels(1)
+        out.setsampwidth(2)
+        out.setframerate(SAMPLE_RATE)
+        out.writeframes(pcm)
+    return buffer.getvalue()
+
+
+def _multipart(fields: Sequence[Tuple[str, str]], filename: str, payload: bytes) -> Tuple[bytes, str]:
+    import uuid
+
+    boundary = f"----auto-video-editor-{uuid.uuid4().hex}"
+    parts: List[bytes] = []
+    for name, value in fields:
+        parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n{value}\r\n'
+                     .encode("utf-8"))
+    parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="{filename}"\r\n'
+                 f"Content-Type: audio/wav\r\n\r\n".encode("utf-8"))
+    parts.append(payload)
+    parts.append(f"\r\n--{boundary}--\r\n".encode("utf-8"))
+    return b"".join(parts), f"multipart/form-data; boundary={boundary}"
+
+
+_LANGUAGE_NAMES = {"russian": "ru", "english": "en", "french": "fr", "german": "de", "spanish": "es",
+                   "italian": "it", "portuguese": "pt", "kazakh": "kk", "kyrgyz": "ky", "uzbek": "uz",
+                   "ukrainian": "uk"}
+
+
+def _language_code(value) -> Optional[str]:
+    if not value or not isinstance(value, str):
+        return None
+    value = value.strip().lower()
+    return _LANGUAGE_NAMES.get(value, value if len(value) <= 3 else None)
+
+
+def _guess_language(text: str) -> Optional[str]:
+    """Servers that do not report the language (GigaAM): tell Cyrillic from Latin script."""
+    letters = [ch for ch in text if ch.isalpha()]
+    if len(letters) < 8:
+        return None
+    cyrillic = sum(1 for ch in letters if "Ѐ" <= ch <= "ӿ")
+    return "ru" if cyrillic > len(letters) / 2 else None
+
+
+def _float(value, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _word_from_json(item: dict) -> Optional[Word]:
+    text = str(item.get("word", item.get("text", ""))).strip()
+    if not text:
+        return None
+    start, end = _float(item.get("start")), _float(item.get("end"))
+    probability = _float(item.get("probability", item.get("confidence", 1.0)), 1.0)
+    # Whisper tokens carry their own leading space, _join_words relies on it.
+    return Word(start, max(end, start), " " + text, probability)
+
+
+def _segments_from_response(data: dict, duration: float) -> List[Segment]:
+    """Turn an OpenAI ``verbose_json`` answer into segments that all have word timings."""
+    raw_segments = [s for s in (data.get("segments") or []) if isinstance(s, dict)]
+    words = [w for w in (_word_from_json(item) for item in (data.get("words") or []) if isinstance(item, dict)) if w]
+    segments: List[Segment] = []
+    for raw in raw_segments:
+        text = str(raw.get("text", "")).strip()
+        start, end = _float(raw.get("start")), _float(raw.get("end"))
+        inner = [w for w in (_word_from_json(i) for i in (raw.get("words") or []) if isinstance(i, dict)) if w]
+        segments.append(Segment(start, max(end, start), text, inner))
+    if words:
+        if segments and not any(seg.words for seg in segments):
+            for word in words:  # top-level words: give each one to the segment it falls in
+                middle = (word.start + word.end) / 2
+                target = min(segments, key=lambda seg: 0 if seg.start <= middle <= seg.end
+                             else min(abs(middle - seg.start), abs(middle - seg.end)))
+                target.words.append(word)
+        elif not segments:
+            segments = _sentences_from_words(words)
+    if not segments and str(data.get("text", "")).strip():
+        segments = [Segment(0.0, duration, str(data["text"]).strip())]
+    for seg in segments:
+        if not seg.words and seg.text:
+            seg.words = _spread_words(seg.text, seg.start, seg.end)
+        for word, following in zip(seg.words, seg.words[1:] + [None]):
+            if word.end - word.start < 0.05:  # GigaAM gives short words no length: captions would flash
+                limit = following.start if following is not None else seg.end
+                word.end = max(word.end, min(word.start + 0.15, limit))
+        if seg.words:
+            seg.start = min(seg.start, seg.words[0].start) if seg.end > seg.start else seg.words[0].start
+            seg.end = max(seg.end, seg.words[-1].end)
+    return [seg for seg in segments if seg.text or seg.words]
+
+
+def _sentences_from_words(words: List[Word], max_gap: float = 1.2, max_length: float = 15.0) -> List[Segment]:
+    segments: List[Segment] = []
+    run: List[Word] = []
+    for word in words:
+        if run and (word.start - run[-1].end > max_gap or word.end - run[0].start > max_length):
+            segments.append(Segment(run[0].start, run[-1].end, _join_words(run), run))
+            run = []
+        run.append(word)
+        if word.text.rstrip()[-1:] in ".!?…":
+            segments.append(Segment(run[0].start, run[-1].end, _join_words(run), run))
+            run = []
+    if run:
+        segments.append(Segment(run[0].start, run[-1].end, _join_words(run), run))
+    return segments
+
+
+def _spread_words(text: str, start: float, end: float) -> List[Word]:
+    """No word timings from the server: share the segment time in proportion to word length."""
+    tokens = text.split()
+    if not tokens or end <= start:
+        return []
+    total = sum(len(t) + 1 for t in tokens)
+    words, cursor = [], start
+    for token in tokens:
+        step = (end - start) * (len(token) + 1) / total
+        words.append(Word(cursor, cursor + step, " " + token, 1.0))
+        cursor += step
+    return words
 
 
 def _offset_segment(seg: Segment, offset: float) -> Segment:

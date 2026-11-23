@@ -73,14 +73,32 @@ class AudioEnvelope:
 
     def save(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_name(path.stem + ".tmp.npz")
-        np.savez_compressed(tmp, hop=self.hop, rms_db=self.rms_db, peak_db=self.peak_db)
-        os.replace(tmp, path)
+        # A temporary name of our own: two runs on the same video must not write into one file.
+        tmp = path.with_name(f"{path.stem}.{os.getpid()}-{threading.get_ident()}.tmp.npz")
+        try:
+            with open(tmp, "wb") as out:
+                np.savez_compressed(out, hop=self.hop, rms_db=self.rms_db, peak_db=self.peak_db)
+                out.flush()
+                os.fsync(out.fileno())  # never publish a file that is not fully on disk
+            os.replace(tmp, path)
+        finally:
+            if tmp.exists():
+                tmp.unlink()
 
     @classmethod
     def load(cls, path: Path) -> "AudioEnvelope":
-        with np.load(path) as data:
-            return cls(float(data["hop"]), data["rms_db"].astype(np.float32), data["peak_db"].astype(np.float32))
+        """Read a cached envelope. Raises ``ValueError`` when the file is damaged (cut short, not a zip...)."""
+        try:
+            with np.load(path) as data:
+                env = cls(float(data["hop"]), data["rms_db"].astype(np.float32),
+                          data["peak_db"].astype(np.float32))
+        except OSError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - BadZipFile, EOFError, zlib.error, KeyError...
+            raise ValueError(f"damaged audio cache {path.name}: {exc}") from exc
+        if env.hop <= 0 or env.rms_db.shape != env.peak_db.shape or not env.rms_db.size:
+            raise ValueError(f"damaged audio cache {path.name}")
+        return env
 
 
 def silent_envelope(duration: float) -> AudioEnvelope:

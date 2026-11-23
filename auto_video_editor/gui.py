@@ -40,7 +40,7 @@ from .insights import (VideoInsights, auto_layout, auto_model, describe_position
 from .reporting import Cancelled, Reporter
 from .settings import DEFAULT_KEYWORDS, PROFILES, Settings, config_dir, settings_path
 from .timeline import format_clock, parse_duration
-from .transcribe import available_backends
+from .transcribe import SpeechServer, available_backends
 
 # -- design tokens: (light, dark) -----------------------------------------------------------------
 BG = ("#f3f4f8", "#0d0f14")
@@ -110,7 +110,8 @@ ENCODER_LABELS = [
 ]
 TRANSCRIBER_LABELS = [
     ("Automatic", "auto"), ("faster-whisper (recommended)", "faster-whisper"),
-    ("OpenAI Whisper", "openai-whisper"), ("Off · audio only", "none"),
+    ("OpenAI Whisper", "openai-whisper"), ("Speech server (HTTP, e.g. Kamerton)", "http"),
+    ("Off · audio only", "none"),
 ]
 MODEL_LABELS = [
     ("Automatic · best for this computer", "auto"), ("Tiny · fastest", "tiny"), ("Base · fast", "base"), ("Small · balanced", "small"),
@@ -1097,6 +1098,19 @@ class App:
                      "transcriber", TRANSCRIBER_LABELS)
         self._option(self._row(speech, "Model", "Bigger models are more accurate but slower on CPU."),
                      "whisper_model", MODEL_LABELS)
+        server = self._row(speech, "Speech server address",
+                           "For the Speech server engine: an OpenAI-compatible API, e.g. a local Kamerton.")
+        self._button(server, "Test", self._test_speech_server, None, "ghost", width=70).pack(side="right")
+        self._entry(server, self._var("stt_url", tk.StringVar), width=260).pack(side="right", padx=(0, 8))
+        self.stt_status = ctk.CTkLabel(server.texts, text="", font=self.f.small, text_color=MUTED, anchor="w",
+                                       height=18)
+        self.stt_status.pack(anchor="w")
+        key = self._entry(self._row(speech, "Speech server API key", "Leave empty if the server has no key."),
+                          self._var("stt_api_key", tk.StringVar), width=260)
+        key.configure(show="•")
+        key.pack(side="right")
+        self._entry(self._row(speech, "Speech server model", "Model name sent to the server (Kamerton: kamerton)."),
+                    self._var("stt_model", tk.StringVar), width=260).pack(side="right")
         self._option(self._row(speech, "Spoken language", "Setting it avoids wrong detections on noisy audio."),
                      "language", LANGUAGES)
         self._slider(self._row(speech, "Beam size", "Higher = slightly more accurate, slower."), "beam_size",
@@ -1424,6 +1438,20 @@ class App:
         self.vars["vocabulary_packs"].set(", ".join(ids))
         self.toast(f"{len(ids)} vocabulary pack{'s' if len(ids) != 1 else ''} selected", "success")
 
+    def _test_speech_server(self) -> None:
+        server = SpeechServer(self.vars["stt_url"].get(), self.vars["stt_api_key"].get(),
+                              self.vars["stt_model"].get().strip())
+        self.stt_status.configure(text=f"Connecting to {server.url}…", text_color=MUTED)
+
+        def job() -> None:
+            try:
+                text, color = f"Connected: {server.check()}", GREEN
+            except RuntimeError as exc:
+                text, color = str(exc), RED
+            self.root.after(0, lambda: self.stt_status.configure(text=text[:110], text_color=color))
+
+        threading.Thread(target=job, daemon=True).start()
+
     def _open_packs_folder(self) -> None:
         folder = write_pack_template()
         open_path(folder)
@@ -1487,7 +1515,11 @@ class App:
         model = self.vars["whisper_model"].get() if "whisper_model" in self.vars else "auto"
         if model == "auto":
             model, _why = auto_model(media.duration)
-        speech = estimate_transcription(media.duration, model) if available_backends() and media.has_audio else 0
+        remote = "transcriber" in self.vars and self.vars["transcriber"].get() == "http"
+        if remote:
+            speech = media.duration * 0.05 if media.has_audio else 0  # Kamerton on CPU: ~20x real time
+        else:
+            speech = estimate_transcription(media.duration, model) if available_backends() and media.has_audio else 0
         reel = Settings(profile="medium").target_for(media.duration)
         shorts = 5 * 40
         hardware = sys.platform == "darwin" or has_cuda()
