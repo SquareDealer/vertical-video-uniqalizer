@@ -328,6 +328,38 @@ The audio is sent in 10-minute 16 kHz WAV windows. Notes:
 - Vocabulary hints are not sent: Kamerton has its own glossary, edited in its web console.
 - If you set `API_KEY` in Kamerton's `.env`, put the same key in *Speech server API key* (`--stt-key`).
 
+## Auto mode (S3)
+
+The editor can run unattended: it polls an S3 bucket for new clips and publishes several vertical
+TikTok versions of each one, so the same clip can be posted from different accounts.
+
+```
+montage/<streamer>/<clip>.mp4                          ← new clip (read only)
+montage/<streamer>/uniqalized/<clip>__v1.mp4 … __v3.mp4  ← versions
+montage/<streamer>/uniqalized/<clip>.manifest.json     ← written last: the set is complete
+```
+
+Every version plays the clip without its pauses, with Kamerton captions (see above), and differs from the
+others in layout, caption style, zoom, color, grain, speed and metadata. A webcam overlay is never cropped.
+
+**Setup.** Copy `.env.example` to `.env` (it is git-ignored) and fill in the S3 keys, start Docker Desktop
+with Kamerton, then:
+
+```bash
+python main.py --watch          # poll every 60 s until Ctrl+C
+python main.py --watch --once   # one pass, handy to test
+```
+
+or open the **Auto (S3)** page of the app and click *Start*. `--set watch_variants=5` or
+`--set watch_interval=120` change the number of versions and the polling interval.
+
+**Integrity.** A clip counts as done only when its manifest names the current source (ETag and size) and
+all its versions exist with the listed sizes. Versions are uploaded to `uniqalized/.partial/`, checked
+(MD5), then copied into place, and the manifest is written last. A crash, a network error or a source that
+is replaced simply means the clip is processed again on the next pass. If Kamerton is down the clip waits:
+nothing is published without captions. A clip that fails 3 times is set aside (reason in
+`<clip>.error.json`) until its file changes. Sources and anything outside `uniqalized/` are never touched.
+
 ## Custom vocabulary packs
 
 Click *My packs folder* in the app (or look at the path printed by `python main.py --list-packs`) and add a

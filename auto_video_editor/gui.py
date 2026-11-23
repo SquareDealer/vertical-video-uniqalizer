@@ -38,7 +38,7 @@ from .glossary import (Pack, all_categories, auto_packs, get_pack, load_packs, p
 from .insights import (VideoInsights, auto_layout, auto_model, describe_position, estimate_render,
                        estimate_transcription, has_cuda, load_insights, save_insights, scan_video)
 from .reporting import Cancelled, Reporter
-from .settings import DEFAULT_KEYWORDS, PROFILES, Settings, config_dir, settings_path
+from .settings import DEFAULT_KEYWORDS, PROFILES, Settings, cache_dir, config_dir, settings_path
 from .timeline import format_clock, parse_duration
 from .transcribe import SpeechServer, available_backends
 
@@ -71,9 +71,10 @@ PAGES = [
     ("detection", "Detection", "Speech recognition and how each second of the recording is scored.", "wave"),
     ("export", "Export", "Encoding, loudness and hand-off files for your editing software.", "export"),
     ("review", "Review", "Preview, keep or drop each moment before rendering.", "star"),
+    ("auto", "Auto (S3)", "Watch the bucket for new clips and publish TikTok versions automatically.", "layers"),
 ]
-SIMPLE_PAGES = ("home", "review")
-NAV_GROUPS = {"home": "CREATE", "highlight": "SETTINGS", "review": "RESULT"}
+SIMPLE_PAGES = ("home", "review", "auto")
+NAV_GROUPS = {"home": "CREATE", "highlight": "SETTINGS", "review": "RESULT", "auto": "AUTOMATION"}
 
 GOALS = [
     ("both", "layers", "Reel + shorts", "A 16:9 highlight reel and vertical clips"),
@@ -402,6 +403,7 @@ class App:
         self._build_detection_page(self.pages["detection"])
         self._build_export_page(self.pages["export"])
         self._build_review_page(self.pages["review"])
+        self._build_auto_page(self.pages["auto"])
         self._build_action_bar(main)
         self._build_log(main)
 
@@ -1842,6 +1844,22 @@ class App:
         kind = event[0]
         if kind == "log":
             self._append_log(event[1])
+        elif kind == "watch_log":
+            self._watch_line(event[1])
+        elif kind == "watch_status":
+            s3_ok, stt_ok = event[1], event[2]
+            chips = self.watch_chips.winfo_children()
+            s3_text = chips[0].cget("text").strip() if chips else "S3 —"
+            stt_text = chips[1].cget("text").strip() if len(chips) > 1 else "Kamerton —"
+            s3_color = chips[0].cget("fg_color") if chips else SUBTLE
+            stt_color = chips[1].cget("fg_color") if len(chips) > 1 else SUBTLE
+            if s3_ok is not None:
+                s3_text, s3_color = ("S3 ✓", GREEN) if s3_ok else ("S3 ✗", RED)
+            if stt_ok is not None:
+                stt_text, stt_color = ("Kamerton ✓", GREEN) if stt_ok else ("Kamerton ✗", RED)
+            self._set_watch_chips(s3_text, stt_text, s3_color, stt_color)
+        elif kind == "watch_done":
+            self.watch_button.configure(text="Start", state="normal", image=themed_icon("play", 15, WHITE))
         elif kind == "progress":
             self._on_progress(event[1], event[2])
         elif kind == "probed":
@@ -2236,12 +2254,117 @@ class App:
         for number, (key, *_rest) in enumerate(PAGES, 1):
             self.root.bind(f"<{mod}-Key-{number}>", lambda _e, k=key: self.show_page(k))
 
+    # ================================================================================================
+    # Auto mode (S3)
+    # ================================================================================================
+    def _build_auto_page(self, page) -> None:
+        self.watch_stop: Optional[threading.Event] = None
+        self.watch_thread: Optional[threading.Thread] = None
+        card = self._section(page, "Auto mode",
+                             "Polls montage/<streamer>/ in S3, renders TikTok versions of each new clip "
+                             "(cuts without pauses, Kamerton captions) and uploads them to "
+                             "<streamer>/uniqalized/ with a manifest. Credentials: the .env file "
+                             "(see .env.example).", "layers")
+        status = self._row(card, "Status", "S3 and the speech server are checked when the watcher starts.")
+        self.watch_chips = ctk.CTkFrame(status, fg_color="transparent")
+        self.watch_chips.pack(side="right")
+        self._set_watch_chips("S3 —", "Kamerton —", SUBTLE, SUBTLE)
+        self._slider(self._row(card, "Versions per clip", "One per TikTok account."), "watch_variants",
+                     1, 10, 1, "{}", integer=True)
+        self._slider(self._row(card, "Check every", "Seconds between two looks at the bucket."), "watch_interval",
+                     10, 600, 10, "{} s", integer=True)
+        controls = self._row(card, "Watcher", "Runs until you stop it or close the app.")
+        self.watch_button = self._button(controls, "Start", self._toggle_watch, "play", "accent", width=130)
+        self.watch_button.pack(side="right")
+        self._end(card)
+
+        history = self._section(page, "Recent activity", "What the watcher did, newest last.", "terminal")
+        self.watch_log = ctk.CTkTextbox(history, height=260, font=self.f.small, fg_color=SUBTLE, corner_radius=10,
+                                        wrap="word", state="disabled")
+        self.watch_log.pack(fill="x", padx=24, pady=(6, 20))
+
+    def _set_watch_chips(self, s3: str, stt: str, s3_color, stt_color) -> None:
+        for child in self.watch_chips.winfo_children():
+            child.destroy()
+        for text, color in ((s3, s3_color), (stt, stt_color)):
+            fg = WHITE if color in (GREEN, RED) else TEXT
+            self._chip(self.watch_chips, text, color, fg).pack(side="left", padx=(6, 0))
+
+    def _watch_line(self, message: str) -> None:
+        self.watch_log.configure(state="normal")
+        self.watch_log.insert("end", message + "\n")
+        lines = int(self.watch_log.index("end-1c").split(".")[0])
+        if lines > 400:
+            self.watch_log.delete("1.0", f"{lines - 400}.0")
+        self.watch_log.see("end")
+        self.watch_log.configure(state="disabled")
+
+    def _toggle_watch(self) -> None:
+        if self.watch_thread and self.watch_thread.is_alive():
+            self.watch_stop.set()
+            self.watch_button.configure(text="Stopping…", state="disabled")
+            self._watch_line("Stopping after the current clip…")
+            return
+        settings = self._collect_settings()
+        if settings is None:
+            return
+        self.watch_stop = threading.Event()
+        self.watch_thread = threading.Thread(target=self._watch_worker, args=(settings, self.watch_stop),
+                                             daemon=True)
+        self.watch_thread.start()
+        self.watch_button.configure(text="Stop", image=themed_icon("stop", 15, WHITE))
+
+    def _watch_worker(self, settings: Settings, stop: threading.Event) -> None:
+        from . import s3watch
+        from .s3store import S3Config, S3Store
+
+        def log(message: str) -> None:
+            self.events.put(("watch_log", message))
+            self.events.put(("log", f"[auto] {message}"))
+            if "Speech server unavailable" in message:
+                self.events.put(("watch_status", None, False))
+
+        try:
+            config = S3Config.from_env()
+            store = S3Store(config)
+            store.list(settings.watch_prefix)  # fails fast on wrong keys or bucket
+            self.events.put(("watch_status", True, None))
+        except Exception as exc:  # noqa: BLE001
+            self.events.put(("watch_status", False, None))
+            log(f"S3 unavailable: {exc}")
+            self.events.put(("watch_done",))
+            return
+        try:
+            server = SpeechServer(settings.stt_url, settings.stt_api_key, settings.stt_model)
+            log(f"Speech server: {server.check()}")
+            self.events.put(("watch_status", None, True))
+        except RuntimeError as exc:
+            self.events.put(("watch_status", None, False))
+            log(f"Speech server not ready, clips will wait: {exc}")
+        root = cache_dir() / "s3watch"
+        try:
+            with s3watch.acquire_lock(root / "watch.lock"):
+                log(f"Watching s3://{config.bucket}/{settings.watch_prefix}<streamer>/ every "
+                    f"{settings.watch_interval} s.")
+                watcher = s3watch.Watcher(store, settings, s3watch.default_render_fn(settings, log), root / "work",
+                                          s3watch.WatchState(root / "state.json"), log)
+                watcher.run_forever(stop)
+        except Exception as exc:  # noqa: BLE001
+            log(f"Watcher stopped: {exc}")
+        finally:
+            log("Watcher stopped.")
+            self.events.put(("watch_done",))
+
     def _on_close(self) -> None:
         if self.worker and self.worker.is_alive():
             if not messagebox.askyesno("Quit", "A job is running. Cancel it and quit?"):
                 return
             if self.reporter:
                 self.reporter.cancel()
+        if self.watch_thread and self.watch_thread.is_alive():
+            if not messagebox.askyesno("Quit", "The auto mode is running. Stop it and quit?"):
+                return
+            self.watch_stop.set()  # an interrupted clip is redone on the next start, never half-published
         self._collect_settings(quiet=True)
         self.root.destroy()
 
