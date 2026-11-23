@@ -1,10 +1,17 @@
 """Auto mode: poll ``montage/<streamer>/`` in S3 and publish TikTok versions of every new clip.
 
+Layout: one folder per source, named after it::
+
+    montage/<streamer>/<clip>.mp4
+    montage/<streamer>/uniqalized/<clip>/status.json     processing | waiting | done | failed
+    montage/<streamer>/uniqalized/<clip>/v1.mp4 … vN.mp4
+    montage/<streamer>/uniqalized/<clip>/manifest.json   written last: the set is complete
+
 Integrity protocol (docs/superpowers/specs/2026-11-23-s3-watch-uniqualize-design.md):
 
 * a clip is ready only when its manifest exists, names the current source ETag and size, and every
   version it lists exists with the listed size;
-* versions are uploaded to ``uniqalized/.partial/`` and checked there, the source is checked again,
+* versions are uploaded to ``uniqalized/<clip>/.partial/`` and checked there, the source is checked again,
   then they are copied to their final names and the manifest is written last;
 * before reprocessing, the old manifest is deleted, so a stale set is never taken for a ready one;
 * nothing outside ``<streamer>/uniqalized/`` is ever written or deleted, sources are read-only.
@@ -53,8 +60,8 @@ class OutputKeys:
     final: List[str]
     partial: List[str]
     manifest: str
-    error: str
-    folder: str
+    status: str
+    folder: str      # uniqalized/<clip>: everything of one source lives here
     stem: str
 
 
@@ -80,11 +87,11 @@ def output_keys(source_key: str, subdir: str, count: int, unique: bool = False) 
     share a stem in one folder (``clip.mp4`` and ``clip.mov``)."""
     folder, name = posixpath.split(source_key)
     stem = name if unique else posixpath.splitext(name)[0]
-    base = f"{folder}/{subdir.strip('/')}"
+    base = f"{folder}/{subdir.strip('/')}/{stem}"
     return OutputKeys(
-        final=[f"{base}/{stem}__v{i}.mp4" for i in range(1, count + 1)],
-        partial=[f"{base}/.partial/{stem}__v{i}.mp4" for i in range(1, count + 1)],
-        manifest=f"{base}/{stem}.manifest.json", error=f"{base}/{stem}.error.json", folder=base, stem=stem,
+        final=[f"{base}/v{i}.mp4" for i in range(1, count + 1)],
+        partial=[f"{base}/.partial/v{i}.mp4" for i in range(1, count + 1)],
+        manifest=f"{base}/manifest.json", status=f"{base}/status.json", folder=base, stem=stem,
     )
 
 
@@ -149,8 +156,18 @@ def _is_missing(exc: BaseException) -> bool:
 
 
 def _finals_of(store: S3Store, keys: OutputKeys) -> List[str]:
-    pattern = re.compile(re.escape(f"{keys.folder}/{keys.stem}__v") + r"\d+\.mp4$")
-    return [o.key for o in store.list(f"{keys.folder}/{keys.stem}__v") if pattern.match(o.key)]
+    pattern = re.compile(re.escape(f"{keys.folder}/v") + r"\d+\.mp4$")
+    return [o.key for o in store.list(f"{keys.folder}/v") if pattern.match(o.key)]
+
+
+def write_status(store: S3Store, keys: OutputKeys, state: str, source: ObjectInfo, **fields) -> None:
+    """``status.json`` of a clip, read by the CRM: processing, waiting, done or failed."""
+    data = {"state": state, "clip_id": (source.metadata or {}).get("clip-id") or None,
+            "source": {"key": source.key, "etag": source.etag}, "updated": _now(), **fields}
+    try:
+        store.put_json(keys.status, data)
+    except Exception:  # noqa: BLE001 - the status is informative, the manifest is the truth
+        pass
 
 
 def _delete_quietly(store: S3Store, keys) -> None:
@@ -175,14 +192,17 @@ def process_clip(store: S3Store, source: ObjectInfo, settings: Settings, render:
         store.delete(key)
     info = store.head(source.key)
     if info is None:
+        _delete_quietly(store, [keys.status])
         log(f"  {source.key}: gone before download, skipped.")
         return None
+    write_status(store, keys, "processing", info, started=_now(), app_version=__version__)
     work.mkdir(parents=True, exist_ok=True)
     local = work / f"source{posixpath.splitext(info.key)[1].lower()}"
     try:
         store.download(info, local)
     except Exception as exc:  # noqa: BLE001
         if _is_missing(exc):
+            _delete_quietly(store, [keys.status])
             log(f"  {source.key}: moved or deleted during download, skipped.")
             return None
         raise
@@ -209,6 +229,7 @@ def process_clip(store: S3Store, source: ObjectInfo, settings: Settings, render:
         current = store.head(info.key)
         if current is None or current.etag != info.etag or current.size != info.size:
             log(f"  {info.key}: the source changed or disappeared during processing, versions discarded.")
+            _delete_quietly(store, [keys.status])
             return None
         for partial, entry in zip(keys.partial, entries):
             copied.append(entry["key"])
@@ -228,7 +249,8 @@ def process_clip(store: S3Store, source: ObjectInfo, settings: Settings, render:
         }
         store.put_json(keys.manifest, manifest)
         published = True
-        store.delete(keys.error)
+        write_status(store, keys, "done", info, manifest=keys.manifest, versions=keys.final,
+                     captions=manifest["captions"])
         return manifest
     finally:
         _delete_quietly(store, keys.partial)
@@ -325,23 +347,22 @@ class Watcher:
                 summary.pending += 1
                 break
             except Exception as exc:  # noqa: BLE001 - one broken clip must not stop the watcher
+                reason = f"{type(exc).__name__}: {exc}"[:2000]
                 if isinstance(exc, SpeechServerUnavailable) and not self._speech_server_answers():
                     summary.pending += 1
                     self.log(f"Speech server unavailable, {source.key} stays in the queue: {exc}")
+                    write_status(self.store, keys, "waiting", source, reason=f"speech server unavailable: {exc}")
                     break
                 if is_transient(exc):
                     summary.pending += 1
-                    self.log(f"Network or storage error, {source.key} will be retried: {type(exc).__name__}: {exc}")
+                    self.log(f"Network or storage error, {source.key} will be retried: {reason}")
+                    write_status(self.store, keys, "waiting", source, reason=f"network or storage error: {reason}")
                     break
                 failures = self.state.record_failure(source, exc)
                 summary.failed += 1
-                self.log(f"FAILED {source.key} ({failures}/{s.watch_max_failures}): {type(exc).__name__}: {exc}")
-                try:
-                    self.store.put_json(keys.error, {"source": source.key, "etag": source.etag,
-                                                     "error": f"{type(exc).__name__}: {exc}"[:2000],
-                                                     "failures": failures, "at": _now()})
-                except Exception:  # noqa: BLE001
-                    pass
+                self.log(f"FAILED {source.key} ({failures}/{s.watch_max_failures}): {reason}")
+                write_status(self.store, keys, "failed", source, error=reason, failures=failures,
+                             parked=failures >= s.watch_max_failures)
             else:
                 if manifest is None:
                     summary.skipped += 1
