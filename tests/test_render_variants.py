@@ -1,0 +1,71 @@
+"""Variation knobs of the renderer: zoom/shift of the game area, speed, effects, extra output args."""
+
+import json
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+
+sys.path.insert(0, str(Path(__file__).parent))
+from _render_cases import CASES, INFO, build  # noqa: E402
+
+from auto_video_editor.ffmpeg import probe  # noqa: E402
+from auto_video_editor.render import Renderer, zoom_window  # noqa: E402
+
+SNAPSHOT = json.loads((Path(__file__).parent / "data" / "render_snapshot.json").read_text())
+
+
+@pytest.mark.parametrize("name", sorted(CASES))
+def test_defaults_unchanged(name):
+    assert build(name) == SNAPSHOT[name]
+
+
+def test_zoom_window_size_and_shift():
+    w, h, x, y = zoom_window(1920, 1080, 1.05, 0.0)
+    assert (w, h) == (1828, 1028) and w % 2 == 0 and h % 2 == 0
+    assert x == (1920 - w) // 2 // 2 * 2 or abs(x - (1920 - w) / 2) <= 2
+    assert zoom_window(1920, 1080, 1.05, -1.0)[2] == 0
+    assert zoom_window(1920, 1080, 1.05, 1.0)[2] == 1920 - w
+    assert zoom_window(1920, 1080, 1.0, 0.7) == (1920, 1080, 0, 0)
+
+
+def test_zoom_window_keeps_facecam():
+    cam = (0.0, 0.0, 0.25, 0.3)  # top-left webcam
+    for shift in (-1.0, 0.0, 1.0):
+        w, h, x, y = zoom_window(1920, 1080, 1.05, shift, keep=cam)
+        assert x <= 0 and y <= 0, f"webcam cut with shift {shift}"
+    right_cam = (0.75, 0.7, 0.25, 0.3)  # bottom-right webcam
+    w, h, x, y = zoom_window(1920, 1080, 1.05, -1.0, keep=right_cam)
+    assert x + w >= 1920 and y + h >= 1080
+
+
+def test_effects_and_extra_args_present():
+    args = build("blur", video_effects="noise=alls=3:allf=t", extra_output_args=["-g", "48"])
+    graph = args[args.index("-filter_complex") + 1]
+    assert graph.index("noise=alls=3:allf=t") < graph.index("ass=c.ass")
+    assert args[-3:] == ["-g", "48", "out.mp4"]
+
+
+def test_speed_and_zoom_reach_the_graph():
+    args = build("split", speed=1.03, game_zoom=1.04, game_shift=0.5, split_top=820)
+    graph = args[args.index("-filter_complex") + 1]
+    assert "setpts=PTS/1.03" in graph and "atempo=1.03" in graph
+    assert ":820" in graph, "camera height follows split_top"
+    assert args[args.index("-t", len(args) - 12) + 1] == f"{6.0 / 1.03:.3f}"
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not installed")
+def test_speed_changes_duration(tmp_path):
+    src = tmp_path / "src.mp4"
+    subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc2=size=640x360:rate=30:duration=6",
+                    "-f", "lavfi", "-i", "sine=frequency=440:duration=6", "-c:v", "libx264", "-preset",
+                    "ultrafast", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest", str(src)], check=True)
+    info = probe(str(src))
+    out = tmp_path / "out.mp4"
+    Renderer(info, "libx264", "draft").render_segment([(0.0, 6.0)], out, layout="blur", speed=1.03,
+                                                      game_zoom=1.03, game_shift=-0.6)
+    result = probe(str(out))
+    assert (result.width, result.height) == (1080, 1920)
+    assert result.duration == pytest.approx(6.0 / 1.03, abs=0.12)

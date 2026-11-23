@@ -31,18 +31,64 @@ def _even(value: float) -> int:
 
 # -- vertical layouts ---------------------------------------------------------------------------
 
+def zoom_window(width: int, height: int, zoom: float, shift: float,
+                keep: Optional[Tuple[float, float, float, float]] = None) -> Tuple[int, int, int, int]:
+    """Crop ``(w, h, x, y)`` that zooms into a ``width``x``height`` picture by ``zoom``.
+
+    ``shift`` (-1..1) moves the window horizontally across the free margin. ``keep`` is a normalized
+    rectangle (a webcam overlay) that must stay fully inside the window.
+    """
+    if zoom <= 1.0:
+        return width, height, 0, 0
+    w, h = min(width, _even(width / zoom)), min(height, _even(height / zoom))
+    free_x, free_y = width - w, height - h
+    shift = max(-1.0, min(1.0, shift))
+    x, y = free_x * (0.5 + shift / 2), free_y / 2
+    if keep:
+        kx, ky, kw, kh = keep
+        left, right = kx * width, (kx + kw) * width
+        top, bottom = ky * height, (ky + kh) * height
+        if right - left <= w:
+            x = min(max(x, right - w), left)
+        if bottom - top <= h:
+            y = min(max(y, bottom - h), top)
+    x = int(min(max(0.0, x), free_x)) // 2 * 2
+    y = int(min(max(0.0, y), free_y)) // 2 * 2
+    if keep:  # rounding down to even pixels must not push the window off the far edge of the overlay
+        if (keep[0] + keep[2]) * width > x + w and x + 2 <= free_x:
+            x += 2
+        if (keep[1] + keep[3]) * height > y + h and y + 2 <= free_y:
+            y += 2
+    return w, h, x, y
+
+
+def _zoom_crop(width: int, height: int, zoom: float, shift: float,
+               keep: Optional[Tuple[float, float, float, float]] = None) -> str:
+    if zoom <= 1.0:
+        return ""
+    w, h, x, y = zoom_window(width, height, zoom, shift, keep)
+    return f"crop={w}:{h}:{x}:{y},"
+
+
 def vertical_filter(src: str, dst: str, info: MediaInfo, layout: str,
                     subject_x: Optional[float] = None,
-                    facecam: Optional[Tuple[float, float, float, float]] = None, blur: int = 10) -> str:
-    """Filter graph that turns ``src`` into a 1080x1920 frame labelled ``dst``."""
+                    facecam: Optional[Tuple[float, float, float, float]] = None, blur: int = 10,
+                    game_zoom: float = 1.0, game_shift: float = 0.0, split_top: int = SPLIT_TOP_H) -> str:
+    """Filter graph that turns ``src`` into a 1080x1920 frame labelled ``dst``.
+
+    ``game_zoom``/``game_shift`` zoom into the game picture only: the webcam of the split layout is
+    left as is, and in the blur layout the zoom never moves ``facecam`` out of frame.
+    """
     W, H = VERTICAL_W, VERTICAL_H
+    src_w, src_h = info.width or 1920, info.height or 1080
     if layout == "blur":
         radius = max(1, min(60, int(blur)))
         return (
             f"{src}split=2[bgsrc][fgsrc];"
             f"[bgsrc]scale=270:480:force_original_aspect_ratio=increase,crop=270:480,"
             f"boxblur={radius}:2,scale={W}:{H},eq=brightness=-0.06:saturation=1.15[bg];"
-            f"[fgsrc]scale={W}:{H}:force_original_aspect_ratio=decrease:force_divisible_by=2[fg];"
+            f"[fgsrc]{_zoom_crop(src_w, src_h, game_zoom, game_shift, facecam)}"
+            f"scale={W}:{H}:force_original_aspect_ratio=decrease:force_divisible_by=2[fg];"
             f"[bg][fg]overlay=(W-w)/2:(H-h)/2,setsar=1{dst}"
         )
     if layout == "split" and facecam:
@@ -50,16 +96,17 @@ def vertical_filter(src: str, dst: str, info: MediaInfo, layout: str,
         cw, ch = _even(fw * info.width), _even(fh * info.height)
         cx = min(max(0, int(fx * info.width)), max(0, info.width - cw))
         cy = min(max(0, int(fy * info.height)), max(0, info.height - ch))
-        bottom = H - SPLIT_TOP_H
+        top = max(2, min(H - 2, _even(split_top)))
+        bottom = H - top
         return (
             f"{src}split=2[camsrc][gamesrc];"
-            f"[camsrc]crop={cw}:{ch}:{cx}:{cy},scale={W}:{SPLIT_TOP_H}:force_original_aspect_ratio=increase,"
-            f"crop={W}:{SPLIT_TOP_H}[cam];"
-            f"[gamesrc]scale={W}:{bottom}:force_original_aspect_ratio=increase,crop={W}:{bottom}[game];"
+            f"[camsrc]crop={cw}:{ch}:{cx}:{cy},scale={W}:{top}:force_original_aspect_ratio=increase,"
+            f"crop={W}:{top}[cam];"
+            f"[gamesrc]{_zoom_crop(src_w, src_h, game_zoom, game_shift)}"
+            f"scale={W}:{bottom}:force_original_aspect_ratio=increase,crop={W}:{bottom}[game];"
             f"[cam][game]vstack=inputs=2,setsar=1{dst}"
         )
     # crop / smart crop
-    src_w, src_h = info.width or 1920, info.height or 1080
     if src_w / src_h > W / H:
         cw, ch = min(src_w, _even(src_h * W / H)), src_h
         center = (subject_x if subject_x is not None else 0.5) * src_w
@@ -67,6 +114,9 @@ def vertical_filter(src: str, dst: str, info: MediaInfo, layout: str,
     else:
         cw, ch = src_w, min(src_h, _even(src_w * H / W))
         x, y = 0, int((src_h - ch) / 2)
+    if game_zoom > 1.0:
+        zw, zh, zx, zy = zoom_window(cw, ch, game_zoom, game_shift)
+        cw, ch, x, y = zw, zh, x + zx, y + zy
     return f"{src}crop={cw}:{ch}:{x}:{y},scale={W}:{H}:flags=lanczos,setsar=1{dst}"
 
 
@@ -135,12 +185,24 @@ class Renderer:
         captions_file: Optional[str] = None,
         fade: float = 0.0,
         audio_filter: Optional[str] = None,
+        speed: float = 1.0,
+        game_zoom: float = 1.0,
+        game_shift: float = 0.0,
+        split_top: int = SPLIT_TOP_H,
+        video_effects: Optional[str] = None,
+        extra_output_args: Sequence[str] = (),
     ) -> List[str]:
-        """ffmpeg arguments that cut ``ranges`` out of the source into one file."""
+        """ffmpeg arguments that cut ``ranges`` out of the source into one file.
+
+        ``speed`` plays the result faster or slower without changing the pitch; ``video_effects`` is an
+        ffmpeg filter chain applied before the captions; ``extra_output_args`` go just before the output.
+        """
         info = self.info
         ranges = [(a, b) for a, b in ranges if b - a > 0.04]
         if not ranges:
             raise ValueError("Nothing to render: empty time range")
+        if not 0.5 <= speed <= 2.0:
+            raise ValueError(f"speed {speed} is outside 0.5..2.0")
         out_duration = total_duration(ranges)
 
         # Chronological ranges share one input. A range that goes back in time (a teaser hook) opens a
@@ -209,14 +271,20 @@ class Renderer:
         video_steps = [f"fps={fps_expression(info.fps)}"]
         if info.width % 2 or info.height % 2:
             video_steps.append("scale=trunc(iw/2)*2:trunc(ih/2)*2")
+        if speed != 1.0:
+            video_steps += [f"setpts=PTS/{speed:g}", f"fps={fps_expression(info.fps)}"]
+            out_duration /= speed
         graph.append(f"{current}{','.join(video_steps)}[vfps]")
         current = "[vfps]"
         if layout:
-            graph.append(vertical_filter(current, "[vlay]", info, layout, subject_x, facecam, self.blur))
+            graph.append(vertical_filter(current, "[vlay]", info, layout, subject_x, facecam, self.blur,
+                                         game_zoom=game_zoom, game_shift=game_shift, split_top=split_top))
             current = "[vlay]"
         tail = []
         if fade > 0:
             tail.append(f"fade=t=in:st=0:d={fade:.3f},fade=t=out:st={max(0.0, out_duration - fade):.3f}:d={fade:.3f}")
+        if video_effects:
+            tail.append(video_effects)
         if captions_file:
             tail.append(f"ass={captions_file}")
         tail.append("format=yuv420p")
@@ -224,7 +292,8 @@ class Renderer:
 
         # Audio post-processing.
         edge_fade = max(fade, MICRO_FADE)
-        audio_steps = [f"afade=t=in:d={edge_fade:.3f}",
+        audio_steps = [f"atempo={speed:g}"] if speed != 1.0 else []
+        audio_steps += [f"afade=t=in:d={edge_fade:.3f}",
                        f"afade=t=out:st={max(0.0, out_duration - edge_fade):.3f}:d={edge_fade:.3f}"]
         if audio_filter:
             audio_steps.append(audio_filter)
@@ -239,6 +308,7 @@ class Renderer:
             *self.audio_args,
             "-t", f"{out_duration:.3f}",
             "-movflags", "+faststart",
+            *extra_output_args,
             output,
         ]
         return args
