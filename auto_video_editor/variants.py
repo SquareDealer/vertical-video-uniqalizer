@@ -55,7 +55,8 @@ def variant_presets(count: int, has_facecam: bool) -> List[VariantSpec]:
         elif i % 3 == 1:
             layout, split_top = "blur", 640
         else:
-            layout, split_top = ("split", 820) if has_facecam else ("smart", 640)
+            # 720 px: a bigger webcam than v1, with a band shaped like a 0.25 x 0.30 overlay (no crop)
+            layout, split_top = ("split", 720) if has_facecam else ("smart", 640)
         shift = look["shift"] + (0.3 * cycle if i % 2 else -0.3 * cycle)
         shift = round(max(-1.0, min(1.0, shift)), 2)
         zoom = look["zoom"] if cycle == 0 else round(look["zoom"] + 0.02 * cycle, 3)

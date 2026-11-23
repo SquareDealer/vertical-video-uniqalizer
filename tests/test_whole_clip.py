@@ -82,3 +82,10 @@ def test_long_clip_without_peaks_falls_back_to_its_start(tmp_path, monkeypatch):
 def test_speech_server_down_raises_unavailable():
     with pytest.raises(SpeechServerUnavailable):
         SpeechServer("http://127.0.0.1:9", timeout=2).check()
+
+
+def test_whole_clip_peak_is_the_loudest_part(tmp_path, monkeypatch):
+    video = _video(tmp_path / "peak.mp4", 20, bursts=[(14, 17)])
+    project = _pipeline(video, tmp_path, monkeypatch).analyze()
+    short = project.shorts[0]
+    assert 13 <= short.peak <= 18, "the hook must come from the best seconds, not the middle"

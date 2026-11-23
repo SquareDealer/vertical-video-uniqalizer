@@ -270,7 +270,8 @@ def _watch(args: argparse.Namespace) -> int:
     try:
         with s3watch.acquire_lock(root / "watch.lock"):
             watcher = s3watch.Watcher(open_store(config), settings, s3watch.default_render_fn(settings, log),
-                                      root / "work", s3watch.WatchState(root / "state.json"), log)
+                                      root / "work", s3watch.WatchState(root / "state.json"), log,
+                                      speech_check=s3watch.speech_check_for(settings))
             stop = threading.Event()
             if args.once:
                 summary = watcher.run_once(stop)

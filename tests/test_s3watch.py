@@ -42,9 +42,11 @@ class FakeRender:
 
     def __init__(self, error=None, on_call=None):
         self.calls, self.error, self.on_call = 0, error, on_call
+        self.cancels = []
 
     def __call__(self, source: Path, work: Path, count: int, cancel: threading.Event):
         self.calls += 1
+        self.cancels.append(cancel)
         assert source.exists() and source.read_bytes().startswith(b"source")
         if self.on_call:
             self.on_call()
@@ -58,10 +60,10 @@ class FakeRender:
         return result
 
 
-def make_watcher(store, tmp_path, render, **settings):
+def make_watcher(store, tmp_path, render, speech_check=None, **settings):
     logs = []
     watcher = Watcher(store, Settings(**settings), render, tmp_path / "work", WatchState(tmp_path / "state.json"),
-                      logs.append)
+                      logs.append, speech_check=speech_check)
     return watcher, logs
 
 
@@ -135,9 +137,10 @@ def test_crash_after_partial_upload_leaves_no_manifest(store, tmp_path, monkeypa
     watcher, _ = make_watcher(store, tmp_path, FakeRender())
     summary = watcher.run_once(threading.Event())
     k = output_keys(SOURCE, "uniqalized", 3)
-    assert summary.failed == 1
+    assert (summary.failed, summary.pending) == (0, 1), "a network error is retried, not counted"
     assert not any(store.head(key) for key in k.final) and store.get_json(k.manifest) is None
-    assert WatchState(tmp_path / "state.json").data[SOURCE]["failures"] == 1
+    assert WatchState(tmp_path / "state.json").data.get(SOURCE, {}).get("failures", 0) == 0
+    assert store.get_json(k.error) is None
 
     monkeypatch.setattr(store, "upload", real_upload)
     assert watcher.run_once(threading.Event()).done == 1
@@ -224,3 +227,94 @@ def test_stale_lock_is_replaced(tmp_path):
     lock.write_text("999999999")
     with acquire_lock(lock):
         assert lock.read_text().strip() == str(os.getpid())
+
+
+def test_rebuild_failure_leaves_no_stale_versions(store, tmp_path):
+    put_source(store)
+    make_watcher(store, tmp_path, FakeRender())[0].run_once(threading.Event())
+    put_source(store, body=b"source-video-v2")
+    watcher, _ = make_watcher(store, tmp_path, FakeRender(error=ValueError("bad frame")))
+    assert watcher.run_once(threading.Event()).failed == 1
+    k = output_keys(SOURCE, "uniqalized", 3)
+    assert not any(store.head(key) for key in k.final), "versions of the old file must not stay under final names"
+    assert store.get_json(k.manifest) is None
+
+
+def test_copy_failure_removes_copied_finals(store, tmp_path, monkeypatch):
+    put_source(store)
+    real_copy, calls = store.copy, []
+
+    def flaky_copy(src, dst):
+        calls.append(dst)
+        if len(calls) == 2:
+            raise RuntimeError("copy refused")
+        return real_copy(src, dst)
+
+    monkeypatch.setattr(store, "copy", flaky_copy)
+    make_watcher(store, tmp_path, FakeRender())[0].run_once(threading.Event())
+    k = output_keys(SOURCE, "uniqalized", 3)
+    assert not any(store.head(key) for key in k.final), "no half-published set"
+
+
+def test_same_stem_sources_do_not_collide(store, tmp_path):
+    put_source(store, key="montage/buster/clip.mp4", body=b"source-a")
+    put_source(store, key="montage/buster/clip.mov", body=b"source-b")
+    render = FakeRender()
+    watcher, _ = make_watcher(store, tmp_path, render)
+    assert watcher.run_once(threading.Event()).done == 2
+    finals = keys(store, "montage/buster/uniqalized/")
+    assert len([k for k in finals if k.endswith(".mp4")]) == 6
+    assert watcher.run_once(threading.Event()).skipped == 2 and render.calls == 2
+
+
+def test_one_bad_clip_does_not_block_the_queue(store, tmp_path):
+    put_source(store, key="montage/buster/a.mp4")
+    put_source(store, key="montage/buster/b.mp4")
+
+    class OneBad(FakeRender):
+        def __call__(self, source, work, count, cancel):
+            if self.calls == 0:
+                self.calls += 1
+                raise SpeechServerUnavailable("read timed out")
+            return super().__call__(source, work, count, cancel)
+
+    watcher, _ = make_watcher(store, tmp_path, OneBad(), speech_check=lambda: True)
+    summary = watcher.run_once(threading.Event())
+    assert (summary.failed, summary.done) == (1, 1), "the server answers, so it was this clip, not the server"
+
+
+def test_network_error_is_retried_not_parked(store, tmp_path):
+    from botocore.exceptions import EndpointConnectionError
+
+    put_source(store)
+    render = FakeRender(error=EndpointConnectionError(endpoint_url="https://s3.test"))
+    watcher, _ = make_watcher(store, tmp_path, render)
+    for _ in range(4):
+        summary = watcher.run_once(threading.Event())
+        assert (summary.pending, summary.failed) == (1, 0)
+    assert render.calls == 4
+    assert store.get_json(output_keys(SOURCE, "uniqalized", 3).error) is None
+
+
+def test_source_deleted_during_download_is_a_quiet_skip(store, tmp_path, monkeypatch):
+    put_source(store)
+    real_download = store.download
+
+    def vanishing_download(info, dest):
+        store.delete(info.key)
+        return real_download(info, dest)
+
+    monkeypatch.setattr(store, "download", vanishing_download)
+    summary = make_watcher(store, tmp_path, FakeRender())[0].run_once(threading.Event())
+    assert (summary.failed, summary.skipped) == (0, 1)
+    assert store.get_json(output_keys(SOURCE, "uniqalized", 3).error) is None
+
+
+def test_stop_lets_the_current_clip_finish(store, tmp_path):
+    put_source(store, key="montage/buster/a.mp4")
+    put_source(store, key="montage/buster/b.mp4")
+    stop = threading.Event()
+    render = FakeRender(on_call=stop.set)
+    summary = make_watcher(store, tmp_path, render)[0].run_once(stop)
+    assert summary.done == 1 and render.calls == 1, "the clip in progress is published, then the watcher stops"
+    assert not render.cancels[0].is_set()

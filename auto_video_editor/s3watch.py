@@ -75,9 +75,11 @@ def is_source_key(key: str, prefix: str) -> bool:
             and parts[1].lower().endswith(VIDEO_EXTENSIONS) and not parts[1].startswith("."))
 
 
-def output_keys(source_key: str, subdir: str, count: int) -> OutputKeys:
+def output_keys(source_key: str, subdir: str, count: int, unique: bool = False) -> OutputKeys:
+    """Keys of the versions of a clip. ``unique`` keeps the extension in the name, for two sources that
+    share a stem in one folder (``clip.mp4`` and ``clip.mov``)."""
     folder, name = posixpath.split(source_key)
-    stem = posixpath.splitext(name)[0]
+    stem = name if unique else posixpath.splitext(name)[0]
     base = f"{folder}/{subdir.strip('/')}"
     return OutputKeys(
         final=[f"{base}/{stem}__v{i}.mp4" for i in range(1, count + 1)],
@@ -115,6 +117,40 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def is_transient(exc: BaseException) -> bool:
+    """Network and server-side hiccups: retried on the next cycle, never counted against the clip."""
+    from .s3store import TransferError
+
+    if isinstance(exc, (ConnectionError, TimeoutError, TransferError)):
+        return True
+    try:
+        from botocore.exceptions import BotoCoreError, ClientError, ConnectionError as BotoConnectionError
+    except ImportError:  # pragma: no cover - boto3 is required by the watch mode
+        return False
+    if isinstance(exc, BotoConnectionError):
+        return True
+    if isinstance(exc, ClientError):
+        response = exc.response or {}
+        status = int((response.get("ResponseMetadata") or {}).get("HTTPStatusCode") or 0)
+        code = str((response.get("Error") or {}).get("Code", ""))
+        return status >= 500 or code in ("SlowDown", "RequestTimeout", "InternalError", "ServiceUnavailable")
+    return isinstance(exc, BotoCoreError) and "timeout" in type(exc).__name__.lower()
+
+
+def _is_missing(exc: BaseException) -> bool:
+    try:
+        from botocore.exceptions import ClientError
+    except ImportError:  # pragma: no cover
+        return False
+    return isinstance(exc, ClientError) and str((exc.response.get("Error") or {}).get("Code", "")) in (
+        "NoSuchKey", "404", "NotFound")
+
+
+def _finals_of(store: S3Store, keys: OutputKeys) -> List[str]:
+    pattern = re.compile(re.escape(f"{keys.folder}/{keys.stem}__v") + r"\d+\.mp4$")
+    return [o.key for o in store.list(f"{keys.folder}/{keys.stem}__v") if pattern.match(o.key)]
+
+
 def _delete_quietly(store: S3Store, keys) -> None:
     for key in keys:
         try:
@@ -124,19 +160,30 @@ def _delete_quietly(store: S3Store, keys) -> None:
 
 
 def process_clip(store: S3Store, source: ObjectInfo, settings: Settings, render: RenderFn, work: Path,
-                 log: Callable[[str], None], cancel: Optional[threading.Event] = None) -> Optional[dict]:
+                 log: Callable[[str], None], cancel: Optional[threading.Event] = None,
+                 unique: bool = False) -> Optional[dict]:
     """Render and publish the versions of one clip. Returns the manifest, or None when the source moved."""
     cancel = cancel or threading.Event()
     count = settings.watch_variants
-    keys = output_keys(source.key, settings.watch_subdir, count)
-    store.delete(keys.manifest)  # from now on the old set is not "ready" any more
+    keys = output_keys(source.key, settings.watch_subdir, count, unique)
+    # From now on the old set is not "ready" any more, and no version of an older file can be taken
+    # for a current one: the manifest and every published version of this clip go first.
+    store.delete(keys.manifest)
+    for key in _finals_of(store, keys):
+        store.delete(key)
     info = store.head(source.key)
     if info is None:
         log(f"  {source.key}: gone before download, skipped.")
         return None
     work.mkdir(parents=True, exist_ok=True)
     local = work / f"source{posixpath.splitext(info.key)[1].lower()}"
-    store.download(info, local)
+    try:
+        store.download(info, local)
+    except Exception as exc:  # noqa: BLE001
+        if _is_missing(exc):
+            log(f"  {source.key}: moved or deleted during download, skipped.")
+            return None
+        raise
     log(f"  downloaded {info.size / 1e6:.1f} MB, rendering {count} versions...")
     variants = render(local, work, count, cancel)
     if len(variants) != count:
@@ -144,6 +191,7 @@ def process_clip(store: S3Store, source: ObjectInfo, settings: Settings, render:
 
     clip_id = info.metadata.get("clip-id") or None
     entries: List[dict] = []
+    copied: List[str] = []
     published = False
     try:
         for i, variant in enumerate(variants):
@@ -161,15 +209,11 @@ def process_clip(store: S3Store, source: ObjectInfo, settings: Settings, render:
             log(f"  {info.key}: the source changed or disappeared during processing, versions discarded.")
             return None
         for partial, entry in zip(keys.partial, entries):
+            copied.append(entry["key"])
             store.copy(partial, entry["key"])
             final = store.head(entry["key"])
             if final is None or final.size != entry["size"]:
                 raise RuntimeError(f"{entry['key']}: copy check failed")
-        stale = re.compile(re.escape(f"{keys.folder}/{keys.stem}__v") + r"(\d+)\.mp4$")
-        for obj in store.list(f"{keys.folder}/{keys.stem}__v"):
-            match = stale.match(obj.key)
-            if match and int(match.group(1)) > count:
-                store.delete(obj.key)
         manifest = {
             "manifest_version": MANIFEST_VERSION, "clip_id": clip_id,
             "source": {"key": info.key, "etag": info.etag, "size": info.size,
@@ -187,6 +231,7 @@ def process_clip(store: S3Store, source: ObjectInfo, settings: Settings, render:
     finally:
         _delete_quietly(store, keys.partial)
         if not published:
+            _delete_quietly(store, copied)  # never leave a half-published set under the final names
             log(f"  {info.key}: not published.")
 
 
@@ -227,8 +272,9 @@ class WatchState:
 
 class Watcher:
     def __init__(self, store: S3Store, settings: Settings, render: RenderFn, work_dir: Path, state: WatchState,
-                 log: Callable[[str], None]) -> None:
+                 log: Callable[[str], None], speech_check: Optional[Callable[[], bool]] = None) -> None:
         self.store, self.settings, self.render = store, settings, render
+        self.speech_check = speech_check
         self.work_dir, self.state, self.log = Path(work_dir), state, log
         self._ready: set = set()  # (key, etag) known to be published, saves S3 requests every cycle
         self._parked_logged: set = set()
@@ -241,11 +287,18 @@ class Watcher:
     def run_once(self, stop: threading.Event) -> Summary:
         summary = Summary()
         s = self.settings
-        for source in self.sources():
+        sources = self.sources()
+        stems: Dict[tuple, int] = {}
+        for source in sources:
+            folder, name = posixpath.split(source.key)
+            stems[(folder, posixpath.splitext(name)[0])] = stems.get((folder, posixpath.splitext(name)[0]), 0) + 1
+        for source in sources:
             if stop.is_set():
                 break
-            keys = output_keys(source.key, s.watch_subdir, s.watch_variants)
-            marker = (source.key, source.etag, s.watch_variants)
+            folder, name = posixpath.split(source.key)
+            unique = stems[(folder, posixpath.splitext(name)[0])] > 1
+            keys = output_keys(source.key, s.watch_subdir, s.watch_variants, unique)
+            marker = (source.key, source.etag, s.watch_variants, unique)
             if marker in self._ready:
                 summary.skipped += 1
                 continue
@@ -263,15 +316,21 @@ class Watcher:
             work = self.work_dir / hashlib.sha1(source.key.encode("utf-8")).hexdigest()[:12]
             shutil.rmtree(work, ignore_errors=True)
             try:
-                manifest = process_clip(self.store, source, s, self.render, work, self.log, stop)
-            except SpeechServerUnavailable as exc:
-                summary.pending += 1
-                self.log(f"Speech server unavailable, {source.key} stays in the queue: {exc}")
-                break
+                # Stopping waits for the clip in progress: its render is never cancelled half way.
+                manifest = process_clip(self.store, source, s, self.render, work, self.log, threading.Event(),
+                                        unique)
             except Cancelled:
                 summary.pending += 1
                 break
             except Exception as exc:  # noqa: BLE001 - one broken clip must not stop the watcher
+                if isinstance(exc, SpeechServerUnavailable) and not self._speech_server_answers():
+                    summary.pending += 1
+                    self.log(f"Speech server unavailable, {source.key} stays in the queue: {exc}")
+                    break
+                if is_transient(exc):
+                    summary.pending += 1
+                    self.log(f"Network or storage error, {source.key} will be retried: {type(exc).__name__}: {exc}")
+                    break
                 failures = self.state.record_failure(source, exc)
                 summary.failed += 1
                 self.log(f"FAILED {source.key} ({failures}/{s.watch_max_failures}): {type(exc).__name__}: {exc}")
@@ -292,6 +351,15 @@ class Watcher:
             finally:
                 shutil.rmtree(work, ignore_errors=True)
         return summary
+
+    def _speech_server_answers(self) -> bool:
+        """After a speech error: is the server itself fine (so this clip is the problem)?"""
+        if self.speech_check is None:
+            return False
+        try:
+            return bool(self.speech_check())
+        except Exception:  # noqa: BLE001
+            return False
 
     def run_forever(self, stop: threading.Event) -> None:
         while not stop.is_set():
@@ -356,6 +424,17 @@ def acquire_lock(path: Path) -> Iterator[None]:
     finally:
         with contextlib.suppress(OSError):
             path.unlink()
+
+
+def speech_check_for(settings: Settings) -> Callable[[], bool]:
+    """Probe used by the watcher to tell a down speech server from a clip the server cannot handle."""
+    from .transcribe import SpeechServer
+
+    def check() -> bool:
+        SpeechServer(settings.stt_url, settings.stt_api_key, settings.stt_model, timeout=10).check()
+        return True
+
+    return check
 
 
 def default_render_fn(settings: Settings, log: Callable[[str], None]) -> RenderFn:

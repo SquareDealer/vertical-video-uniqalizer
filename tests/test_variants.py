@@ -20,7 +20,10 @@ def test_presets_never_crop_with_facecam():
     with_cam = variant_presets(3, True)
     assert [s.index for s in with_cam] == [1, 2, 3]
     assert {s.layout for s in with_cam} <= {"split", "blur"}
-    assert with_cam[2].layout == "split" and with_cam[2].split_top == 820
+    assert with_cam[2].layout == "split" and with_cam[2].split_top == 720
+    # a typical 0.25 x 0.30 webcam of a 16:9 frame (480x324, aspect 1.48) loses < 5 % in a 1080x720 band
+    band_aspect, cam_aspect = 1080 / with_cam[2].split_top, 480 / 324
+    assert abs(1 - cam_aspect / band_aspect) < 0.05
     assert variant_presets(3, False)[2].layout == "smart"
     assert variant_presets(3, False)[0].layout == "blur"
 

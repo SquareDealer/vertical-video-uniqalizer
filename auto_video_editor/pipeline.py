@@ -10,6 +10,8 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+
+import numpy as np
 from typing import List, Optional, Tuple
 
 from . import __version__, publish, vision
@@ -351,7 +353,7 @@ class Pipeline:
         if s.whole_clip:
             highlight = []
             if whole:
-                shorts = [self._whole_clip_moment(transcript, info.duration)]
+                shorts = [self._whole_clip_moment(transcript, info.duration, curve)]
                 self.log(f"Whole clip: one vertical short of {format_clock(shorts[0].duration)} before cuts.")
             else:
                 shorts = plan_shorts(candidates, curve, transcript, env, info.duration, 1, min(20.0, s.whole_clip_cut),
@@ -485,13 +487,18 @@ class Pipeline:
         return keep
 
     @staticmethod
-    def _whole_clip_moment(transcript: Optional[Transcript], duration: float) -> Moment:
+    def _whole_clip_moment(transcript: Optional[Transcript], duration: float, curve=None) -> Moment:
         words = list(transcript.words()) if transcript is not None else []
         start, end = 0.0, duration
         if words:
             start = max(0.0, words[0].start - 0.3)
             end = min(duration, words[-1].end + 0.5)
-        return Moment(start=start, end=end, score=100.0, peak=(start + end) / 2, reasons=["whole clip"])
+        peak = (start + end) / 2
+        if curve is not None and len(curve.score):
+            a, b = int(start), min(len(curve.score), int(end) + 1)
+            if b > a:  # the best second of the clip: the hook of a version opens on it
+                peak = min(end, a + int(np.argmax(curve.score[a:b])) + 0.5)
+        return Moment(start=start, end=end, score=100.0, peak=peak, reasons=["whole clip"])
 
     def _cache_file(self, kind: str, name: str) -> Path:
         return cache_dir() / kind / name
