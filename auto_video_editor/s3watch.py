@@ -38,6 +38,7 @@ from .reporting import Cancelled
 from .s3store import ObjectInfo, S3Store, file_md5
 from .settings import Settings
 from .transcribe import SpeechServerUnavailable
+from .webhook import WebhookOutbox, published_event
 
 VIDEO_EXTENSIONS = (".mp4", ".mov", ".mkv")
 MANIFEST_VERSION = 1
@@ -296,8 +297,10 @@ class WatchState:
 
 class Watcher:
     def __init__(self, store: S3Store, settings: Settings, render: RenderFn, work_dir: Path, state: WatchState,
-                 log: Callable[[str], None], speech_check: Optional[Callable[[], bool]] = None) -> None:
+                 log: Callable[[str], None], speech_check: Optional[Callable[[], bool]] = None,
+                 webhook: Optional[WebhookOutbox] = None) -> None:
         self.store, self.settings, self.render = store, settings, render
+        self.webhook = webhook  # CRM notification after a publish; None = the CRM reads the bucket
         self.speech_check = speech_check
         self.work_dir, self.state, self.log = Path(work_dir), state, log
         self._ready: set = set()  # (key, etag) known to be published, saves S3 requests every cycle
@@ -311,6 +314,7 @@ class Watcher:
     def run_once(self, stop: threading.Event) -> Summary:
         summary = Summary()
         s = self.settings
+        self._flush_webhook()  # events left from earlier cycles or runs
         sources = self.sources()
         stems: Dict[tuple, int] = {}
         for source in sources:
@@ -371,9 +375,23 @@ class Watcher:
                     self.state.clear(source.key)
                     self._ready.add(marker)
                     self.log(f"Published {len(manifest['variants'])} versions of {source.key}.")
+                    if self.webhook is not None:
+                        try:
+                            self.webhook.add(published_event(manifest, keys.folder, keys.manifest, keys.status))
+                        except Exception as exc:  # noqa: BLE001 - the publish stands either way
+                            self.log(f"CRM webhook: cannot queue the event: {exc}")
+                        self._flush_webhook()
             finally:
                 shutil.rmtree(work, ignore_errors=True)
         return summary
+
+    def _flush_webhook(self) -> None:
+        if self.webhook is None:
+            return
+        try:
+            self.webhook.flush()
+        except Exception as exc:  # noqa: BLE001 - never stops the watcher
+            self.log(f"CRM webhook: {type(exc).__name__}: {exc}")
 
     def _speech_server_answers(self) -> bool:
         """After a speech error: is the server itself fine (so this clip is the problem)?"""
@@ -447,6 +465,17 @@ def acquire_lock(path: Path) -> Iterator[None]:
     finally:
         with contextlib.suppress(OSError):
             path.unlink()
+
+
+def webhook_for(root: Path, log: Callable[[str], None], env_file: Optional[Path] = None) -> Optional[WebhookOutbox]:
+    """The CRM webhook queue when ``AVE_WEBHOOK_URL`` is set, else None."""
+    from .webhook import WebhookConfig
+
+    config = WebhookConfig.from_env(env_file)
+    if config is None:
+        return None
+    log(f"CRM webhook: {config!r}")
+    return WebhookOutbox(Path(root) / "webhook.json", config, log)
 
 
 def speech_check_for(settings: Settings) -> Callable[[], bool]:

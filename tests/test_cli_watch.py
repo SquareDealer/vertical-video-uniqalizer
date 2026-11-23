@@ -58,3 +58,32 @@ def test_watch_requires_credentials(isolated, capsys):
     code = cli.main(["--watch", "--once", "--env-file", str(isolated / "missing.env")])
     assert code == 2
     assert "AVE_S3_ENDPOINT" in capsys.readouterr().err
+
+
+def test_watch_once_sends_crm_webhook(isolated, monkeypatch, capsys):
+    from test_webhook import CRM
+
+    monkeypatch.delenv("AVE_WEBHOOK_URL", raising=False)
+    monkeypatch.delenv("AVE_WEBHOOK_SECRET", raising=False)
+    crm = CRM()
+    env = isolated / ".env"
+    env.write_text(f"AVE_S3_ENDPOINT=https://s3.test\nAVE_S3_BUCKET={BUCKET}\n"
+                   "AVE_S3_ACCESS_KEY=AKIATEST\nAVE_S3_SECRET_KEY=topsecret\n"
+                   f"AVE_WEBHOOK_URL={crm.url}\nAVE_WEBHOOK_SECRET=hooksecret\n", encoding="utf-8")
+    try:
+        with moto.mock_aws():
+            client = boto3.client("s3", region_name="us-east-1", aws_access_key_id="x", aws_secret_access_key="y")
+            client.create_bucket(Bucket=BUCKET)
+            client.put_object(Bucket=BUCKET, Key=SOURCE, Body=b"source", Metadata={"clip-id": "c1"})
+            store = S3Store(S3Config("https://s3.test", BUCKET, "k", "s", region="us-east-1"), client=client)
+            monkeypatch.setattr("auto_video_editor.cli.open_store", lambda config: store)
+            monkeypatch.setattr("auto_video_editor.s3watch.default_render_fn", fake_render_fn)
+            assert cli.main(["--watch", "--once", "--env-file", str(env)]) == 0
+        assert len(crm.requests) == 1
+        request = crm.requests[0]
+        assert b'"clip_id": "c1"' in request["body"]
+        assert request["headers"]["X-AVE-Signature"].startswith("sha256=")
+    finally:
+        crm.close()
+    out = capsys.readouterr()
+    assert "hooksecret" not in out.out + out.err

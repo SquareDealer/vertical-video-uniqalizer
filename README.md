@@ -365,6 +365,11 @@ is replaced simply means the clip is processed again on the next pass. If Kamert
 nothing is published without captions. A clip that fails 3 times is set aside (reason in its
 `status.json`, `"state": "failed"`) until its file changes. Sources and anything outside `uniqalized/` are never touched.
 
+**CRM webhook (optional).** Set `AVE_WEBHOOK_URL` (and `AVE_WEBHOOK_SECRET` for an HMAC-SHA256 signature in
+`X-AVE-Signature`) in `.env`, and after each publish the watcher sends a `POST` with the clip id, the source, the
+version keys and the manifest. Undelivered events are retried with a growing pause, also after a restart; the
+bucket stays the source of truth. Contract for the CRM side: [docs/crm-integration.md](docs/crm-integration.md).
+
 ## Custom vocabulary packs
 
 Click *My packs folder* in the app (or look at the path printed by `python main.py --list-packs`) and add a
