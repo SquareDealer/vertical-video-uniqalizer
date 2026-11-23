@@ -120,6 +120,12 @@ def vertical_filter(src: str, dst: str, info: MediaInfo, layout: str,
     return f"{src}crop={cw}:{ch}:{x}:{y},scale={W}:{H}:flags=lanczos,setsar=1{dst}"
 
 
+def caption_top_margin(layout: str, split_top: int = SPLIT_TOP_H) -> Optional[int]:
+    """Top margin for captions placed at the top: below the webcam band of the split layout, so they
+    never cover the streamer's face. None = the usual top margin."""
+    return split_top + 40 if layout == "split" else None
+
+
 def caption_margin(layout: str, info: MediaInfo) -> int:
     """Vertical margin (from the bottom) that keeps captions off the busy parts of the frame."""
     if layout == "split":

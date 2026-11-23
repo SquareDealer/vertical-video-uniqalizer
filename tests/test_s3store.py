@@ -97,3 +97,68 @@ def test_json_roundtrip_and_missing(store):
     assert store.get_json("x/missing.json") is None
     store.put_json("x/m.json", {"a": "клип"})
     assert store.get_json("x/m.json") == {"a": "клип"}
+
+
+class _DroppingBody:
+    """A response body that delivers ``limit`` bytes, then the connection drops."""
+
+    def __init__(self, body, limit):
+        self.body, self.limit = body, limit
+
+    def iter_chunks(self, size):
+        from botocore.exceptions import IncompleteReadError
+
+        sent = 0
+        for chunk in self.body.iter_chunks(size):
+            if sent + len(chunk) > self.limit:
+                yield chunk[: self.limit - sent]
+                raise IncompleteReadError(actual_bytes=self.limit, expected_bytes=10 ** 9)
+            sent += len(chunk)
+            yield chunk
+
+
+def test_download_resumes_after_dropped_connections(store, tmp_path, monkeypatch):
+    src = tmp_path / "clip.mp4"
+    src.write_bytes(os.urandom(3 * 1024 * 1024 + 123))
+    info = store.upload(src, "montage/buster/clip.mp4", {})
+    real_get, ranges = store.client.get_object, []
+
+    def flaky_get(**kwargs):
+        ranges.append(kwargs.get("Range"))
+        response = real_get(**kwargs)
+        if len(ranges) <= 2:  # the first two requests drop after 1 MB
+            response["Body"] = _DroppingBody(response["Body"], 1024 * 1024)
+        return response
+
+    monkeypatch.setattr(store.client, "get_object", flaky_get)
+    monkeypatch.setattr("auto_video_editor.s3store.RETRY_PAUSE", 0.0)
+    dest = tmp_path / "dl.mp4"
+    store.download(info, dest)
+    assert dest.read_bytes() == src.read_bytes()
+    assert ranges == [None, "bytes=1048576-", "bytes=2097152-"], "each retry resumes where the data stopped"
+
+
+def test_download_gives_up_after_repeated_drops(store, tmp_path, monkeypatch):
+    from botocore.exceptions import IncompleteReadError
+
+    src = tmp_path / "clip.mp4"
+    src.write_bytes(os.urandom(2 * 1024 * 1024))
+    info = store.upload(src, "montage/buster/clip.mp4", {})
+    real_get = store.client.get_object
+
+    def always_drops(**kwargs):
+        response = real_get(**kwargs)
+        response["Body"] = _DroppingBody(response["Body"], 0)
+        return response
+
+    monkeypatch.setattr(store.client, "get_object", always_drops)
+    monkeypatch.setattr("auto_video_editor.s3store.RETRY_PAUSE", 0.0)
+    with pytest.raises(IncompleteReadError):
+        store.download(info, tmp_path / "dl.mp4")
+    assert not list(tmp_path.glob("dl.mp4*"))
+
+
+def test_client_does_not_send_optional_checksums():
+    config = S3Config("https://s3.example.test", "b", "k", "s")
+    client = S3Store(config).client
+    assert client.meta.config.request_checksum_calculation == "when_required"

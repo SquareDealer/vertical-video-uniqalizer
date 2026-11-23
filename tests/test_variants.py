@@ -90,3 +90,17 @@ def test_three_variants_differ(tmp_path, monkeypatch):
         assert got == pytest.approx(want, abs=0.2), "same cuts in every version, only hook and speed differ"
     hashes = {hashlib.md5(p.read_bytes()).hexdigest() for p in outputs}
     assert len(hashes) == 3
+
+
+def test_top_captions_stay_below_the_webcam_band():
+    from auto_video_editor.captions import build_ass
+    from auto_video_editor.render import caption_top_margin
+
+    assert caption_top_margin("split", 720) == 760
+    assert caption_top_margin("blur", 720) is None
+    words = [TimedWord(0.0, 1.0, "рот")]
+    ass = build_ass(words, position="top", top_margin=760)
+    style = next(line for line in ass.splitlines() if line.startswith("Style:"))
+    assert style.split(",")[-2] == "760" and style.split(",")[18] == "8", "top-aligned, 760 px from the top"
+    default = next(line for line in build_ass(words, position="top").splitlines() if line.startswith("Style:"))
+    assert default.split(",")[-2] == str(int(1920 * 0.14)), "other layouts keep the usual top margin"

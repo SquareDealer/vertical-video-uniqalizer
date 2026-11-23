@@ -26,7 +26,7 @@ from .insights import (VideoInsights, auto_layout, auto_model, auto_shorts_count
                        scan_video, speech_stats)
 from .moments import (Moment, build_curve, compute_hook, compute_keep_ranges, find_candidates, plan_shorts,
                       select_highlight)
-from .render import Renderer, caption_margin, loudnorm_apply_filter
+from .render import SPLIT_TOP_H, Renderer, caption_margin, caption_top_margin, loudnorm_apply_filter
 from .variants import VariantSpec, speed_words
 from .reporting import Reporter
 from .settings import CONTENT_LABELS, Settings, cache_dir
@@ -794,7 +794,8 @@ class Pipeline:
                             font=s.caption_font, size_scale=s.caption_size / 100.0,
                             uppercase=s.caption_uppercase, highlight=s.caption_color,
                             max_words=s.caption_words, position=s.caption_position,
-                            speaker_colors=s.caption_speaker_colors)
+                            speaker_colors=s.caption_speaker_colors,
+                            top_margin=caption_top_margin(short_layout, render_options.get("split_top", SPLIT_TOP_H)))
             (work / captions_file).write_text(ass, encoding="utf-8")
 
         audio_filter = None

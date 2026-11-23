@@ -318,3 +318,18 @@ def test_stop_lets_the_current_clip_finish(store, tmp_path):
     summary = make_watcher(store, tmp_path, render)[0].run_once(stop)
     assert summary.done == 1 and render.calls == 1, "the clip in progress is published, then the watcher stops"
     assert not render.cancels[0].is_set()
+
+
+def test_dropped_download_is_retried_not_counted(store, tmp_path, monkeypatch):
+    from botocore.exceptions import IncompleteReadError
+
+    put_source(store)
+
+    def dropping_download(info, dest):
+        raise IncompleteReadError(actual_bytes=5637240, expected_bytes=63611757)
+
+    monkeypatch.setattr(store, "download", dropping_download)
+    watcher, _ = make_watcher(store, tmp_path, FakeRender())
+    summary = watcher.run_once(threading.Event())
+    assert (summary.pending, summary.failed) == (1, 0)
+    assert store.get_json(output_keys(SOURCE, "uniqalized", 3).error) is None

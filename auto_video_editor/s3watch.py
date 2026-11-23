@@ -121,7 +121,9 @@ def is_transient(exc: BaseException) -> bool:
     """Network and server-side hiccups: retried on the next cycle, never counted against the clip."""
     from .s3store import TransferError
 
-    if isinstance(exc, (ConnectionError, TimeoutError, TransferError)):
+    from .s3store import _dropped
+
+    if isinstance(exc, (ConnectionError, TimeoutError, TransferError)) or _dropped(exc):
         return True
     try:
         from botocore.exceptions import BotoCoreError, ClientError, ConnectionError as BotoConnectionError

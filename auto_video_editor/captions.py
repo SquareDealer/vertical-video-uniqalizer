@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable, List, Sequence
+from typing import Iterable, List, Optional, Sequence
 
 from .timeline import TimeMap, format_ass_time, format_srt_time
 
@@ -88,7 +88,7 @@ def ass_color(hex_color: str) -> str:
 def build_ass(words: Sequence[TimedWord], width: int = 1080, height: int = 1920,
               style: str = "karaoke", margin_v: int = 0, font: str = "Arial", size_scale: float = 1.0,
               uppercase: bool = True, highlight: str = "#FFE600", max_words: int = 3,
-              position: str = "auto", speaker_colors: bool = False) -> str:
+              position: str = "auto", speaker_colors: bool = False, top_margin: Optional[int] = None) -> str:
     """Build an ASS subtitle file with bold, centered captions.
 
     ``karaoke`` highlights the active word (``highlight`` color) with a small pop animation;
@@ -100,7 +100,7 @@ def build_ass(words: Sequence[TimedWord], width: int = 1080, height: int = 1920,
     outline = max(3, int(font_size * 0.09))
     alignment = 2
     if position == "top":
-        alignment, margin_v = 8, int(height * 0.14)
+        alignment, margin_v = 8, top_margin if top_margin is not None else int(height * 0.14)
     elif position == "middle":
         alignment, margin_v = 5, 0
     elif position == "bottom":

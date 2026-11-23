@@ -11,6 +11,7 @@ import base64
 import hashlib
 import json
 import os
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -20,6 +21,8 @@ ENV_NAMES = {"endpoint": "AVE_S3_ENDPOINT", "bucket": "AVE_S3_BUCKET",
              "access_key": "AVE_S3_ACCESS_KEY", "secret_key": "AVE_S3_SECRET_KEY"}
 DEFAULT_ENV_FILE = Path(__file__).resolve().parent.parent / ".env"
 _CHUNK = 1024 * 1024
+DOWNLOAD_ATTEMPTS = 8      # dropped connections tolerated per download, each retry resumes
+RETRY_PAUSE = 3.0          # seconds, grows with each retry
 
 
 class TransferError(RuntimeError):
@@ -90,6 +93,18 @@ def file_md5(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _dropped(exc: BaseException) -> bool:
+    """A connection that broke while the body was streaming: worth resuming."""
+    if isinstance(exc, (ConnectionError, TimeoutError)):
+        return True
+    try:
+        from botocore.exceptions import (ConnectionError as BotoConnectionError, IncompleteReadError,
+                                         ReadTimeoutError, ResponseStreamingError)
+    except ImportError:  # pragma: no cover
+        return False
+    return isinstance(exc, (BotoConnectionError, IncompleteReadError, ReadTimeoutError, ResponseStreamingError))
+
+
 class S3Store:
     def __init__(self, config: S3Config, client=None) -> None:
         self.config = config
@@ -101,7 +116,13 @@ class S3Store:
             client = boto3.client(
                 "s3", endpoint_url=config.endpoint, region_name=config.region,
                 aws_access_key_id=config.access_key, aws_secret_access_key=config.secret_key,
-                config=Config(signature_version="s3v4", retries={"max_attempts": 5, "mode": "standard"}),
+                # Integrity is checked with Content-MD5 and sizes. The optional CRC32 checksums of recent
+                # botocore versions are not understood by every S3-compatible storage, so send them only
+                # when an operation requires them.
+                config=Config(signature_version="s3v4", retries={"max_attempts": 5, "mode": "standard"},
+                              request_checksum_calculation="when_required",
+                              response_checksum_validation="when_required",
+                              connect_timeout=20, read_timeout=120),
             )
         self.client = client
 
@@ -131,12 +152,25 @@ class S3Store:
         dest.parent.mkdir(parents=True, exist_ok=True)
         tmp = dest.with_name(f"{dest.name}.{os.getpid()}.part")
         try:
-            response = self.client.get_object(Bucket=self.bucket, Key=info.key)
             digest = hashlib.md5()
+            received, attempt = 0, 0
             with open(tmp, "wb") as out:
-                for chunk in response["Body"].iter_chunks(_CHUNK):
-                    out.write(chunk)
-                    digest.update(chunk)
+                while True:
+                    try:
+                        request = {"Bucket": self.bucket, "Key": info.key}
+                        if received:  # resume where the dropped connection stopped
+                            request["Range"] = f"bytes={received}-"
+                        response = self.client.get_object(**request)
+                        for chunk in response["Body"].iter_chunks(_CHUNK):
+                            out.write(chunk)
+                            digest.update(chunk)
+                            received += len(chunk)
+                        break
+                    except Exception as exc:  # noqa: BLE001
+                        attempt += 1
+                        if not _dropped(exc) or attempt >= DOWNLOAD_ATTEMPTS or received >= info.size:
+                            raise
+                        time.sleep(RETRY_PAUSE * attempt)
             size = tmp.stat().st_size
             if size != info.size:
                 raise TransferError(f"{info.key}: downloaded {size} bytes, expected {info.size}")
