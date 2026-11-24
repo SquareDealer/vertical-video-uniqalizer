@@ -74,21 +74,38 @@ class Summary:
     pending: int = 0
 
 
-def is_source_key(key: str, prefix: str) -> bool:
-    """A clip lies exactly at ``<prefix><streamer>/<file>`` and has a video extension."""
+def _is_nested(source_key: str, prefix: Optional[str]) -> bool:
+    """``<prefix><streamer>/<broadcast>/<clip>``: the layout of the Autoclipper since 2026-11-24."""
+    return bool(prefix) and source_key.startswith(prefix) and len(source_key[len(prefix):].split("/")) == 3
+
+
+def is_source_key(key: str, prefix: str, subdir: str = "uniqalized") -> bool:
+    """A clip has a video extension and lies at ``<prefix><streamer>/<file>`` (old layout) or at
+    ``<prefix><streamer>/<broadcast>/<file>`` (broadcast folders). Never inside the versions folder."""
     if not key.startswith(prefix):
         return False
     parts = key[len(prefix):].split("/")
-    return (len(parts) == 2 and all(p.strip() for p in parts)
-            and parts[1].lower().endswith(VIDEO_EXTENSIONS) and not parts[1].startswith("."))
+    if len(parts) not in (2, 3) or not all(p.strip() for p in parts) or any(p.startswith(".") for p in parts):
+        return False
+    if len(parts) == 3 and parts[1] == subdir.strip("/"):
+        return False
+    return parts[-1].lower().endswith(VIDEO_EXTENSIONS)
 
 
-def output_keys(source_key: str, subdir: str, count: int, unique: bool = False) -> OutputKeys:
+def output_keys(source_key: str, subdir: str, count: int, unique: bool = False,
+                prefix: Optional[str] = None) -> OutputKeys:
     """Keys of the versions of a clip. ``unique`` keeps the extension in the name, for two sources that
-    share a stem in one folder (``clip.mp4`` and ``clip.mov``)."""
+    share a stem in one folder (``clip.mp4`` and ``clip.mov``).
+
+    A clip in a broadcast folder gets ``<broadcast>/<clip>/<subdir>/``, next to it; a clip of the old
+    layout keeps ``<streamer>/<subdir>/<clip>/``, so its published versions stay valid.
+    """
     folder, name = posixpath.split(source_key)
     stem = name if unique else posixpath.splitext(name)[0]
-    base = f"{folder}/{subdir.strip('/')}/{stem}"
+    if _is_nested(source_key, prefix):
+        base = f"{folder}/{stem}/{subdir.strip('/')}"
+    else:
+        base = f"{folder}/{subdir.strip('/')}/{stem}"
     return OutputKeys(
         final=[f"{base}/v{i}.mp4" for i in range(1, count + 1)],
         partial=[f"{base}/.partial/v{i}.mp4" for i in range(1, count + 1)],
@@ -185,7 +202,7 @@ def process_clip(store: S3Store, source: ObjectInfo, settings: Settings, render:
     """Render and publish the versions of one clip. Returns the manifest, or None when the source moved."""
     cancel = cancel or threading.Event()
     count = settings.watch_variants
-    keys = output_keys(source.key, settings.watch_subdir, count, unique)
+    keys = output_keys(source.key, settings.watch_subdir, count, unique, settings.watch_prefix)
     # From now on the old set is not "ready" any more, and no version of an older file can be taken
     # for a current one: the manifest and every published version of this clip go first.
     store.delete(keys.manifest)
@@ -308,7 +325,7 @@ class Watcher:
 
     def sources(self) -> List[ObjectInfo]:
         prefix = self.settings.watch_prefix
-        found = [o for o in self.store.list(prefix) if is_source_key(o.key, prefix)]
+        found = [o for o in self.store.list(prefix) if is_source_key(o.key, prefix, self.settings.watch_subdir)]
         return sorted(found, key=lambda o: (o.last_modified or datetime.min.replace(tzinfo=timezone.utc), o.key))
 
     def run_once(self, stop: threading.Event) -> Summary:
@@ -325,7 +342,7 @@ class Watcher:
                 break
             folder, name = posixpath.split(source.key)
             unique = stems[(folder, posixpath.splitext(name)[0])] > 1
-            keys = output_keys(source.key, s.watch_subdir, s.watch_variants, unique)
+            keys = output_keys(source.key, s.watch_subdir, s.watch_variants, unique, s.watch_prefix)
             marker = (source.key, source.etag, s.watch_variants, unique)
             if marker in self._ready:
                 summary.skipped += 1

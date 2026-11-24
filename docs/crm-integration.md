@@ -1,19 +1,27 @@
 # Интеграция с CRM: статус уникализации тикета
 
 Для разработчика Свайпера / CRM. Нарезчик (AVE) в автоматическом режиме опрашивает
-`montage/<стример>/`, делает 3 версии каждого клипа для TikTok и кладёт их в бакет. CRM узнаёт о
+`montage/<стример>/<эфир>/`, делает 3 версии каждого клипа для TikTok и кладёт их в бакет. CRM узнаёт о
 результате, **читая бакет**: новый API не нужен, а бакет — единственный источник истины.
 
 ## Где что лежит
 
+Раскладка по контракту `contracts/s3-layout.json` (папки эфиров, с 2026-11-24):
+
 ```
-montage/<стример>/<имя>.mp4                          ← исходник, его кладёт Свайпер (AVE его только читает)
-montage/<стример>/uniqalized/<имя>/status.json       ← состояние для CRM
-montage/<стример>/uniqalized/<имя>/v1.mp4 … v3.mp4   ← версии
-montage/<стример>/uniqalized/<имя>/manifest.json     ← пишется последним: набор готов
+montage/<стример>/<эфир>/<имя>.mp4                          ← исходник, его кладёт Свайпер (AVE только читает)
+montage/<стример>/<эфир>/<имя>/uniqalized/status.json       ← состояние для CRM
+montage/<стример>/<эфир>/<имя>/uniqalized/v1.mp4 … v3.mp4   ← версии
+montage/<стример>/<эфир>/<имя>/uniqalized/manifest.json     ← пишется последним: набор готов
 ```
 
-`<имя>` — имя файла исходника без расширения. Если в одной папке стримера лежат два исходника с одним
+`<эфир>` — `<id эфира Twitch>_<начало записи>`, например `324159870123_2026-11-20_18-02`.
+
+Клипы, перенесённые до появления папок эфиров (`montage/<стример>/<имя>.mp4`, без папки эфира),
+обрабатываются по-старому, их версии лежат в `montage/<стример>/uniqalized/<имя>/`. Где именно лежат
+версии конкретного клипа, всегда видно по `folder` в webhook и по путям в `status.json`.
+
+`<имя>` — имя файла исходника без расширения. Если в одной папке лежат два исходника с одним
 именем и разными расширениями (`clip.mp4` и `clip.mov`), папка называется с расширением (`clip.mov`).
 Подпапку `.partial/` внутри папки клипа CRM должна игнорировать: там временные файлы.
 
@@ -24,13 +32,14 @@ montage/<стример>/uniqalized/<имя>/manifest.json     ← пишетс�
    `status.json`, `manifest.json` и метаданные каждой версии. Нужно, чтобы Свайпер при создании тикета из
    `to_sort/` сохранял `clip-id` (запрос HEAD объекта, поле `Metadata["clip-id"]`).
 2. **По пути исходника (запасной способ).** `source.key` в `status.json`/`manifest.json` — полный путь
-   исходника в `montage/`, а имя папки в `uniqalized/` совпадает с именем файла.
+   исходника в `montage/`. Папка версий лежит рядом с исходником и называется так же, как его файл:
+   `<имя>.mp4` → `<имя>/uniqalized/`.
 
 ## Состояния
 
 | Что в бакете | `status.json` → `state` | Статус тикета |
 |---|---|---|
-| исходник в `montage/<стример>/`, папки клипа ещё нет | — | Ждёт уникализации |
+| исходник в `montage/<стример>/<эфир>/`, папки клипа ещё нет | — | Ждёт уникализации |
 | AVE взял клип в работу | `processing` | Уникализируется |
 | сервер распознавания речи или сеть недоступны, клип ждёт | `waiting` (+ `reason`) | Уникализируется (задержка) |
 | `manifest.json` есть и `manifest.source.etag` == ETag исходника | `done` | Готово: 3 ссылки из `manifest.variants[].key` |
@@ -55,16 +64,16 @@ montage/<стример>/uniqalized/<имя>/manifest.json     ← пишетс�
 
 ```json
 {"state": "processing", "clip_id": "a7cdbf5a-14f6-420c-8f2c-f3b5d4256f4a",
- "source": {"key": "montage/buster/2026-11-20_21-59-44_reaction_6f4a.mp4", "etag": "d8773630…-8"},
+ "source": {"key": "montage/buster/324159870123_2026-11-20_18-02/2026-11-20_21-59-44_reaction_6f4a.mp4", "etag": "d8773630…-8"},
  "updated": "2026-11-23T18:40:12+00:00", "started": "2026-11-23T18:40:12+00:00", "app_version": "2.2.0"}
 ```
 
 `status.json` готово:
 
 ```json
-{"state": "done", "clip_id": "a7cdbf5a-…", "source": {"key": "montage/buster/…mp4", "etag": "d8773630…-8"},
- "updated": "…", "manifest": "montage/buster/uniqalized/2026-11-20_21-59-44_reaction_6f4a/manifest.json",
- "versions": ["montage/buster/uniqalized/2026-11-20_21-59-44_reaction_6f4a/v1.mp4", "…/v2.mp4", "…/v3.mp4"],
+{"state": "done", "clip_id": "a7cdbf5a-…", "source": {"key": "montage/buster/324159870123_2026-11-20_18-02/…mp4", "etag": "d8773630…-8"},
+ "updated": "…", "manifest": "montage/buster/324159870123_2026-11-20_18-02/2026-11-20_21-59-44_reaction_6f4a/uniqalized/manifest.json",
+ "versions": ["montage/buster/324159870123_2026-11-20_18-02/2026-11-20_21-59-44_reaction_6f4a/uniqalized/v1.mp4", "…/v2.mp4", "…/v3.mp4"],
  "captions": true}
 ```
 
@@ -72,7 +81,7 @@ montage/<стример>/uniqalized/<имя>/manifest.json     ← пишетс�
 
 ```json
 {"manifest_version": 1, "clip_id": "a7cdbf5a-…",
- "source": {"key": "montage/buster/…mp4", "etag": "d8773630…-8", "size": 63611757, "last_modified": "…"},
+ "source": {"key": "montage/buster/324159870123_2026-11-20_18-02/…mp4", "etag": "d8773630…-8", "size": 63611757, "last_modified": "…"},
  "durations": {"source": 66.05, "versions": [62.5, 64.5, 63.8]}, "captions": true,
  "variants": [{"key": "…/v1.mp4", "size": 76861234, "md5": "…", "sha256": "…", "duration": 62.5,
                "captions": true, "spec": {"layout": "split", "caption_style": "karaoke", "…": "…"}}],
@@ -98,8 +107,8 @@ webhook не дошёл, публикация не отменяется.
 
 ```json
 {"event": "published", "event_id": "a7cdbf5a-…:d8773630…-8", "clip_id": "a7cdbf5a-…",
- "source": {"key": "montage/buster/…mp4", "etag": "d8773630…-8", "size": 63611757, "last_modified": "…"},
- "folder": "montage/buster/uniqalized/2026-11-20_21-59-44_reaction_6f4a",
+ "source": {"key": "montage/buster/324159870123_2026-11-20_18-02/…mp4", "etag": "d8773630…-8", "size": 63611757, "last_modified": "…"},
+ "folder": "montage/buster/324159870123_2026-11-20_18-02/2026-11-20_21-59-44_reaction_6f4a/uniqalized",
  "versions": ["…/v1.mp4", "…/v2.mp4", "…/v3.mp4"],
  "manifest_key": "…/manifest.json", "status_key": "…/status.json",
  "manifest": {"manifest_version": 1, "…": "полный manifest.json"}}
