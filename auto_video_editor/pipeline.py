@@ -794,7 +794,7 @@ class Pipeline:
                             font=s.caption_font, size_scale=s.caption_size / 100.0,
                             uppercase=s.caption_uppercase, highlight=s.caption_color,
                             max_words=s.caption_words, position=s.caption_position,
-                            speaker_colors=s.caption_speaker_colors,
+                            speaker_colors=s.caption_speaker_colors, text_color=s.caption_text_color,
                             top_margin=caption_top_margin(short_layout, render_options.get("split_top", SPLIT_TOP_H)))
             (work / captions_file).write_text(ass, encoding="utf-8")
 
@@ -817,6 +817,8 @@ class Pipeline:
         if s.shorts_layout == "auto":
             s.shorts_layout = "blur"
         s.caption_style, s.caption_color, s.caption_position = spec.caption_style, spec.caption_color, spec.caption_position
+        # The color tells the versions apart: per-speaker colors would override it.
+        s.caption_text_color, s.caption_speaker_colors = spec.caption_text_color, False
         s.shorts_hook, s.quality = spec.hook, spec.quality
         self.settings = s
         output = Path(output)

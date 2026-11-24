@@ -123,6 +123,7 @@ class Settings:
     caption_position: str = "auto"
     caption_uppercase: bool = True
     caption_color: str = "#FFE600"  # color of the word being spoken
+    caption_text_color: str = "#FFFFFF"  # color of the other words
     caption_words: int = 3          # maximum words per caption line
     caption_speaker_colors: bool = True  # one text color per detected speaker
 
@@ -304,6 +305,8 @@ class Settings:
         check_range("audio_bitrate", 64, 320)
         if not re.fullmatch(r"#?[0-9a-fA-F]{6}", self.caption_color.strip()):
             errors.append("caption_color must be a hex color such as #FFE600")
+        if not re.fullmatch(r"#?[0-9a-fA-F]{6}", self.caption_text_color.strip()):
+            errors.append("caption_text_color must be a hex color such as #FFFFFF")
         if self.make_shorts and self.shorts_layout == "split":
             try:
                 if self.facecam_rect() is None:
