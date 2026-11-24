@@ -44,7 +44,7 @@ class FakeRender:
         self.calls, self.error, self.on_call = 0, error, on_call
         self.cancels = []
 
-    def __call__(self, source: Path, work: Path, count: int, cancel: threading.Event):
+    def __call__(self, source: Path, work: Path, count: int, cancel: threading.Event, options=None):
         self.calls += 1
         self.cancels.append(cancel)
         assert source.exists() and source.read_bytes().startswith(b"source")
@@ -286,7 +286,7 @@ def test_one_bad_clip_does_not_block_the_queue(store, tmp_path):
     put_source(store, key="montage/buster/b.mp4")
 
     class OneBad(FakeRender):
-        def __call__(self, source, work, count, cancel):
+        def __call__(self, source, work, count, cancel, options=None):
             if self.calls == 0:
                 self.calls += 1
                 raise SpeechServerUnavailable("read timed out")

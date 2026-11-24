@@ -69,3 +69,22 @@ def test_speed_changes_duration(tmp_path):
     result = probe(str(out))
     assert (result.width, result.height) == (1080, 1920)
     assert result.duration == pytest.approx(6.0 / 1.03, abs=0.12)
+
+
+def test_stream_area_is_the_game_picture_of_the_split_layout():
+    # INFO is 1920x1080; the Swiper drew the game in the top 62 % of the frame
+    args = build("split", game_area=(0.0, 0.0, 1.0, 0.62))
+    graph = args[args.index("-filter_complex") + 1]
+    game = graph[graph.index(";[gamesrc]") + 1:]
+    assert game.startswith("[gamesrc]crop=1920:670:0:0,"), "the game is cut from the stream area first"
+    cam = graph[graph.index(";[camsrc]"):graph.index(";[gamesrc]")]
+    assert "670" not in cam, "the webcam band is not affected"
+    zoomed = build("split", game_area=(0.1, 0.1, 0.5, 0.5), game_zoom=1.05)
+    graph = zoomed[zoomed.index("-filter_complex") + 1]
+    assert "[gamesrc]crop=960:540:192:108,crop=" in graph, "the zoom works inside the stream area"
+
+
+def test_stream_area_in_the_blur_layout():
+    args = build("blur", game_area=(0.0, 0.0, 1.0, 0.62))
+    graph = args[args.index("-filter_complex") + 1]
+    assert "[fgsrc]crop=1920:670:0:0," in graph

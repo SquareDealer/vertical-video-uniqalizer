@@ -89,3 +89,39 @@ def test_whole_clip_peak_is_the_loudest_part(tmp_path, monkeypatch):
     project = _pipeline(video, tmp_path, monkeypatch).analyze()
     short = project.shorts[0]
     assert 13 <= short.peak <= 18, "the hook must come from the best seconds, not the middle"
+
+
+def test_full_mode_keeps_the_whole_long_clip(tmp_path, monkeypatch):
+    video = _video(tmp_path / "long.mp4", 24, bursts=[(2, 5), (15, 18)])
+    duration = probe(str(video)).duration
+    project = _pipeline(video, tmp_path, monkeypatch, whole_clip_max=10, whole_clip_cut=6,
+                        whole_clip_full=True).analyze()
+    short = project.shorts[0]
+    assert (short.start, short.end) == (0.0, pytest.approx(duration, abs=0.1)), "montage-mode full: never trimmed"
+
+
+def test_full_mode_does_not_trim_around_the_words():
+    from auto_video_editor.captions import TimedWord
+
+    class Words:
+        def words(self):
+            return [TimedWord(3.0, 4.0, "а"), TimedWord(10.0, 11.0, "б")]
+
+    full = Pipeline._whole_clip_moment(Words(), 20.0, full=True)
+    assert (full.start, full.end) == (0.0, 20.0)
+    cut = Pipeline._whole_clip_moment(Words(), 20.0)
+    assert (cut.start, cut.end) == (pytest.approx(2.7), pytest.approx(11.5))
+
+
+def test_render_variant_uses_the_stream_area(tmp_path, monkeypatch):
+    from auto_video_editor.variants import variant_presets
+
+    video = _video(tmp_path / "clip.mp4", 6, bursts=[(0, 6)])
+    pipeline = _pipeline(video, tmp_path, monkeypatch, facecam="0.7,0.65,0.275,0.3056",
+                         stream_area="0,0,1,0.62")
+    project = pipeline.analyze()
+    seen = []
+    monkeypatch.setattr(Pipeline, "_render_one_short",
+                        lambda self, *a, **k: seen.append(k) or ("split", None, []))
+    pipeline.render_variant(project, variant_presets(1, True)[0], tmp_path / "v1.mp4")
+    assert seen[0]["game_area"] == (0.0, 0.0, 1.0, 0.62)

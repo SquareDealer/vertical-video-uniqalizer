@@ -111,9 +111,11 @@ class Settings:
     whole_clip: bool = False
     whole_clip_max: float = 180.0   # longer clips are cut to their best fragment...
     whole_clip_cut: float = 90.0    # ...of at most this length
+    whole_clip_full: bool = False   # the whole length, never trimmed (montage-mode full of the Swiper)
     shorts_layout: str = "auto"
     shorts_hook: bool = False      # open each short with its best 3 seconds, then play it from the start
     facecam: str = ""  # "x,y,w,h" as fractions of the frame, used by the split layout
+    stream_area: str = ""  # "x,y,w,h": the game picture of the vertical layouts; "" = the whole frame
     blur_strength: int = 10
     shorts_jump_cuts: bool = True
     captions: bool = True
@@ -236,15 +238,10 @@ class Settings:
         return cls.from_dict(data)
 
     def facecam_rect(self) -> Optional[Tuple[float, float, float, float]]:
-        if not self.facecam.strip():
-            return None
-        try:
-            x, y, w, h = (float(v) for v in self.facecam.replace(" ", "").split(","))
-        except ValueError:
-            raise ValueError("facecam must be 'x,y,w,h' with values between 0 and 1")
-        if not (0 <= x < 1 and 0 <= y < 1 and 0 < w <= 1 and 0 < h <= 1 and x + w <= 1.0001 and y + h <= 1.0001):
-            raise ValueError("facecam must be 'x,y,w,h' with values between 0 and 1")
-        return x, y, w, h
+        return _rect(self.facecam, "facecam")
+
+    def stream_area_rect(self) -> Optional[Tuple[float, float, float, float]]:
+        return _rect(self.stream_area, "stream_area")
 
     def validate(self) -> List[str]:
         errors = []
@@ -307,6 +304,10 @@ class Settings:
             errors.append("caption_color must be a hex color such as #FFE600")
         if not re.fullmatch(r"#?[0-9a-fA-F]{6}", self.caption_text_color.strip()):
             errors.append("caption_text_color must be a hex color such as #FFFFFF")
+        try:
+            self.stream_area_rect()
+        except ValueError as exc:
+            errors.append(str(exc))
         if self.make_shorts and self.shorts_layout == "split":
             try:
                 if self.facecam_rect() is None:
@@ -401,6 +402,19 @@ def _coerce(default: Any, value: Any) -> Any:
 # -- application directories --------------------------------------------------------
 
 APP_DIR_NAME = "auto-video-editor"
+
+
+def _rect(value: str, name: str) -> Optional[Tuple[float, float, float, float]]:
+    """``"x,y,w,h"`` as fractions of the frame, or None when empty."""
+    if not value.strip():
+        return None
+    try:
+        x, y, w, h = (float(v) for v in value.replace(" ", "").split(","))
+    except ValueError:
+        raise ValueError(f"{name} must be 'x,y,w,h' with values between 0 and 1")
+    if not (0 <= x < 1 and 0 <= y < 1 and 0 < w <= 1 and 0 < h <= 1 and x + w <= 1.0001 and y + h <= 1.0001):
+        raise ValueError(f"{name} must be 'x,y,w,h' with values between 0 and 1")
+    return x, y, w, h
 
 
 def cache_dir() -> Path:

@@ -46,7 +46,7 @@ ANALYSIS_KEYS = (
     "diversity", "min_score", "beam_size", "weight_loudness", "weight_spikes", "weight_speech", "weight_keywords",
     "weight_exclamations", "skip_start", "skip_end", "auto_trim", "vocabulary", "vocabulary_packs", "auto_vocabulary",
     "profanity_prompt", "censor_profanity", "censor_words", "diarize", "speaker_count",
-    "whole_clip", "whole_clip_max", "whole_clip_cut",
+    "whole_clip", "whole_clip_max", "whole_clip_cut", "whole_clip_full",
 )
 
 
@@ -306,7 +306,7 @@ class Pipeline:
         min_clip = min(s.min_clip, max(2.0, info.duration / 4))
         max_clip = max(min_clip, s.max_clip)
         limit = max(40, int(s.target_for(info.duration) / min_clip * 3) + 30)
-        whole = s.whole_clip and info.duration <= s.whole_clip_max
+        whole = s.whole_clip and (s.whole_clip_full or info.duration <= s.whole_clip_max)
         candidates = [] if whole else find_candidates(curve, env, transcript, info.duration, min_clip, max_clip,
                                                       limit, lead=s.context_before, tail=s.context_after)
         if not candidates and not s.whole_clip:
@@ -353,7 +353,7 @@ class Pipeline:
         if s.whole_clip:
             highlight = []
             if whole:
-                shorts = [self._whole_clip_moment(transcript, info.duration, curve)]
+                shorts = [self._whole_clip_moment(transcript, info.duration, curve, s.whole_clip_full)]
                 self.log(f"Whole clip: one vertical short of {format_clock(shorts[0].duration)} before cuts.")
             else:
                 shorts = plan_shorts(candidates, curve, transcript, env, info.duration, 1, min(20.0, s.whole_clip_cut),
@@ -487,10 +487,12 @@ class Pipeline:
         return keep
 
     @staticmethod
-    def _whole_clip_moment(transcript: Optional[Transcript], duration: float, curve=None) -> Moment:
+    def _whole_clip_moment(transcript: Optional[Transcript], duration: float, curve=None,
+                           full: bool = False) -> Moment:
+        """The clip from its first to its last word, or from 0 to the end when ``full``."""
         words = list(transcript.words()) if transcript is not None else []
         start, end = 0.0, duration
-        if words:
+        if words and not full:
             start = max(0.0, words[0].start - 0.3)
             end = min(duration, words[-1].end + 0.5)
         peak = (start + end) / 2
@@ -852,6 +854,7 @@ class Pipeline:
             _layout, _x, words = self._render_one_short(
                 project, m, output, renderer, work, ranges, f"v{spec.index}.ass", layout, facecam, adaptive=False,
                 speed=spec.speed, game_zoom=spec.zoom, game_shift=spec.shift, split_top=spec.split_top,
+                game_area=s.stream_area_rect(),
                 video_effects=spec.effects, extra_output_args=extra)
             return output, bool(words) and s.captions
         finally:
