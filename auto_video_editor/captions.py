@@ -88,11 +88,12 @@ def ass_color(hex_color: str) -> str:
 def build_ass(words: Sequence[TimedWord], width: int = 1080, height: int = 1920,
               style: str = "karaoke", margin_v: int = 0, font: str = "Arial", size_scale: float = 1.0,
               uppercase: bool = True, highlight: str = "#FFE600", max_words: int = 3,
-              position: str = "auto", speaker_colors: bool = False, top_margin: Optional[int] = None) -> str:
+              position: str = "auto", speaker_colors: bool = False, top_margin: Optional[int] = None,
+              text_color: str = "#FFFFFF") -> str:
     """Build an ASS subtitle file with bold, centered captions.
 
     ``karaoke`` highlights the active word (``highlight`` color) with a small pop animation;
-    ``simple`` shows plain white lines. ``position`` is auto (``margin_v`` from the bottom),
+    ``simple`` shows plain lines. ``text_color`` is the color of the text. ``position`` is auto (``margin_v`` from the bottom),
     top, middle or bottom. With ``speaker_colors`` each detected speaker gets its own text color.
     """
     multi_speaker = speaker_colors and len({w.speaker for w in words}) > 1
@@ -117,7 +118,7 @@ def build_ass(words: Sequence[TimedWord], width: int = 1080, height: int = 1920,
         "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, "
         "Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, "
         "Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n"
-        f"Style: Caption,{font},{font_size},&H00FFFFFF,&H00FFFFFF,&H00000000,&H80000000,"
+        f"Style: Caption,{font},{font_size},&H00{ass_color(text_color)[2:-1]},&H00FFFFFF,&H00000000,&H80000000,"
         f"-1,0,0,0,100,100,1,0,1,{outline},2,{alignment},60,60,{margin_v},1\n\n"
         "[Events]\n"
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"

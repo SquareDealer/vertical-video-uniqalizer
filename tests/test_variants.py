@@ -28,6 +28,19 @@ def test_presets_never_crop_with_facecam():
     assert variant_presets(3, False)[0].layout == "blur"
 
 
+def test_every_version_is_split_with_a_webcam():
+    specs = variant_presets(3, True)
+    assert [s.layout for s in specs] == ["split", "split", "split"]
+    assert len({s.split_top for s in specs}) == 3, "the webcam band differs between versions"
+
+
+def test_every_version_has_its_own_caption_color():
+    specs = variant_presets(3, True)
+    colors = [s.caption_text_color.upper() for s in specs]
+    assert len(set(colors)) == 3 and "#FFFFFF" not in colors
+    assert [s.caption_text_color for s in specs] == [s.caption_text_color for s in variant_presets(3, False)]
+
+
 def test_presets_follow_the_spec_table():
     v1, v2, v3 = variant_presets(3, True)
     assert (v1.hook, v2.hook, v3.hook) == (False, True, False)
@@ -71,6 +84,14 @@ def test_three_variants_differ(tmp_path, monkeypatch):
     project = pipeline.analyze()
     outputs = []
     specs = variant_presets(3, True)
+    seen = []
+    original = Pipeline._render_one_short
+
+    def spy(self, project, m, path, renderer, work, ranges, captions_name, layout, *args, **kwargs):
+        seen.append((layout, self.settings.caption_text_color, self.settings.caption_speaker_colors))
+        return original(self, project, m, path, renderer, work, ranges, captions_name, layout, *args, **kwargs)
+
+    monkeypatch.setattr(Pipeline, "_render_one_short", spy)
     short = project.shorts[0]
     edited = total_duration(short.ranges(True))
     expected = [(edited + (total_duration(short.hook) if spec.hook else 0.0)) / spec.speed for spec in specs]
@@ -90,6 +111,10 @@ def test_three_variants_differ(tmp_path, monkeypatch):
         assert got == pytest.approx(want, abs=0.2), "same cuts in every version, only hook and speed differ"
     hashes = {hashlib.md5(p.read_bytes()).hexdigest() for p in outputs}
     assert len(hashes) == 3
+    assert [row[0] for row in seen] == ["split"] * 3
+    assert [row[1] for row in seen] == [spec.caption_text_color for spec in specs]
+    assert not any(row[2] for row in seen), "speaker colors would override the version color"
+    assert pipeline.settings.caption_text_color == "#FFFFFF", "user settings restored"
 
 
 def test_top_captions_stay_below_the_webcam_band():
@@ -104,3 +129,15 @@ def test_top_captions_stay_below_the_webcam_band():
     assert style.split(",")[-2] == "760" and style.split(",")[18] == "8", "top-aligned, 760 px from the top"
     default = next(line for line in build_ass(words, position="top").splitlines() if line.startswith("Style:"))
     assert default.split(",")[-2] == str(int(1920 * 0.14)), "other layouts keep the usual top margin"
+
+
+def test_caption_text_color():
+    from auto_video_editor.captions import build_ass
+
+    words = [TimedWord(0.0, 1.0, "рот"), TimedWord(1.0, 2.0, "кот")]
+    for style in ("karaoke", "simple"):
+        ass = build_ass(words, style=style, text_color="#39FF88", highlight="#FFFFFF")
+        style_line = next(line for line in ass.splitlines() if line.startswith("Style:"))
+        assert style_line.split(",")[3] == "&H0088FF39", style
+    default = next(line for line in build_ass(words).splitlines() if line.startswith("Style:"))
+    assert default.split(",")[3] == "&H00FFFFFF"
