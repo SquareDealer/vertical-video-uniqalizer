@@ -27,7 +27,7 @@ def isolated(tmp_path, monkeypatch):
 
 
 def fake_render_fn(settings, log):
-    def render(source, work, count, cancel: threading.Event):
+    def render(source, work, count, cancel: threading.Event, options=None):
         out = []
         for i in range(1, count + 1):
             path = work / f"v{i}.mp4"

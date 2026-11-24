@@ -70,24 +70,40 @@ def _zoom_crop(width: int, height: int, zoom: float, shift: float,
     return f"crop={w}:{h}:{x}:{y},"
 
 
+def _area_crop(width: int, height: int, area: Optional[Tuple[float, float, float, float]]) -> Tuple[str, int, int]:
+    """Crop of the stream area (the game picture drawn in the Swiper): filter prefix and its size."""
+    if not area:
+        return "", width, height
+    x, y, w, h = area
+    cw, ch = min(width, _even(w * width)), min(height, _even(h * height))
+    cx = min(max(0, int(round(x * width))), width - cw)
+    cy = min(max(0, int(round(y * height))), height - ch)
+    return f"crop={cw}:{ch}:{cx}:{cy},", cw, ch
+
+
 def vertical_filter(src: str, dst: str, info: MediaInfo, layout: str,
                     subject_x: Optional[float] = None,
                     facecam: Optional[Tuple[float, float, float, float]] = None, blur: int = 10,
-                    game_zoom: float = 1.0, game_shift: float = 0.0, split_top: int = SPLIT_TOP_H) -> str:
+                    game_zoom: float = 1.0, game_shift: float = 0.0, split_top: int = SPLIT_TOP_H,
+                    game_area: Optional[Tuple[float, float, float, float]] = None) -> str:
     """Filter graph that turns ``src`` into a 1080x1920 frame labelled ``dst``.
+
+    ``game_area`` (x, y, w, h fractions) is the game picture of the blur and split layouts; without it
+    the whole frame is used.
 
     ``game_zoom``/``game_shift`` zoom into the game picture only: the webcam of the split layout is
     left as is, and in the blur layout the zoom never moves ``facecam`` out of frame.
     """
     W, H = VERTICAL_W, VERTICAL_H
     src_w, src_h = info.width or 1920, info.height or 1080
+    area, area_w, area_h = _area_crop(src_w, src_h, game_area)
     if layout == "blur":
         radius = max(1, min(60, int(blur)))
         return (
             f"{src}split=2[bgsrc][fgsrc];"
             f"[bgsrc]scale=270:480:force_original_aspect_ratio=increase,crop=270:480,"
             f"boxblur={radius}:2,scale={W}:{H},eq=brightness=-0.06:saturation=1.15[bg];"
-            f"[fgsrc]{_zoom_crop(src_w, src_h, game_zoom, game_shift, facecam)}"
+            f"[fgsrc]{area}{_zoom_crop(area_w, area_h, game_zoom, game_shift, None if game_area else facecam)}"
             f"scale={W}:{H}:force_original_aspect_ratio=decrease:force_divisible_by=2[fg];"
             f"[bg][fg]overlay=(W-w)/2:(H-h)/2,setsar=1{dst}"
         )
@@ -102,7 +118,7 @@ def vertical_filter(src: str, dst: str, info: MediaInfo, layout: str,
             f"{src}split=2[camsrc][gamesrc];"
             f"[camsrc]crop={cw}:{ch}:{cx}:{cy},scale={W}:{top}:force_original_aspect_ratio=increase,"
             f"crop={W}:{top}[cam];"
-            f"[gamesrc]{_zoom_crop(src_w, src_h, game_zoom, game_shift)}"
+            f"[gamesrc]{area}{_zoom_crop(area_w, area_h, game_zoom, game_shift)}"
             f"scale={W}:{bottom}:force_original_aspect_ratio=increase,crop={W}:{bottom}[game];"
             f"[cam][game]vstack=inputs=2,setsar=1{dst}"
         )
@@ -195,6 +211,7 @@ class Renderer:
         game_zoom: float = 1.0,
         game_shift: float = 0.0,
         split_top: int = SPLIT_TOP_H,
+        game_area: Optional[Tuple[float, float, float, float]] = None,
         video_effects: Optional[str] = None,
         extra_output_args: Sequence[str] = (),
     ) -> List[str]:
@@ -284,7 +301,8 @@ class Renderer:
         current = "[vfps]"
         if layout:
             graph.append(vertical_filter(current, "[vlay]", info, layout, subject_x, facecam, self.blur,
-                                         game_zoom=game_zoom, game_shift=game_shift, split_top=split_top))
+                                         game_zoom=game_zoom, game_shift=game_shift, split_top=split_top,
+                                         game_area=game_area))
             current = "[vlay]"
         tail = []
         if fade > 0:

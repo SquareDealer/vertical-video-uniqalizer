@@ -53,7 +53,59 @@ class RenderedVariant:
     source_duration: float = 0.0
 
 
-RenderFn = Callable[[Path, Path, int, threading.Event], List[RenderedVariant]]
+@dataclass
+class ClipOptions:
+    """What the Swiper says about a clip (object metadata, read with HEAD)."""
+    facecam: str = ""        # webcam-region "x,y,w,h", fractions of the frame; "" = detect it
+    stream_area: str = ""    # stream-region: the game picture; "" = the whole frame
+    mode: str = "cut"        # cut: pauses removed; full: the whole length as it is
+    stream_id: str = ""
+    notes: List[str] = field(default_factory=list)  # metadata values that were ignored, and why
+
+
+MONTAGE_MODES = ("cut", "full")
+
+
+def _region(value: str) -> Optional[str]:
+    try:
+        x, y, w, h = (float(v) for v in value.replace(" ", "").split(","))
+    except ValueError:
+        return None
+    if 0 <= x < 1 and 0 <= y < 1 and 0 < w <= 1 and 0 < h <= 1 and x + w <= 1.0001 and y + h <= 1.0001:
+        return value.replace(" ", "")
+    return None
+
+
+def clip_options(metadata: Optional[Dict[str, str]]) -> ClipOptions:
+    """Read ``webcam-region``, ``stream-region``, ``montage-mode`` and ``stream-id`` of a source."""
+    meta = {k.lower(): (v or "").strip() for k, v in (metadata or {}).items()}
+    options = ClipOptions(stream_id=meta.get("stream-id", ""))
+    for name, attr in (("webcam-region", "facecam"), ("stream-region", "stream_area")):
+        if meta.get(name):
+            value = _region(meta[name])
+            if value is None:
+                options.notes.append(f"{name}={meta[name]!r} is not x,y,w,h between 0 and 1, ignored")
+            else:
+                setattr(options, attr, value)
+    mode = meta.get("montage-mode", "")
+    if mode in MONTAGE_MODES:
+        options.mode = mode
+    elif mode:
+        options.notes.append(f"montage-mode={mode!r} is unknown, using cut")
+    return options
+
+
+def watch_settings(settings: Settings, options: ClipOptions) -> Settings:
+    """Settings of one clip in auto mode: Kamerton captions, the regions and the mode of the Swiper."""
+    s = Settings.from_dict(settings.to_dict())
+    s.whole_clip, s.transcriber, s.captions = True, "http", True
+    s.whole_clip_full = options.mode == "full"
+    s.shorts_jump_cuts = not s.whole_clip_full
+    s.facecam, s.stream_area = options.facecam, options.stream_area
+    return s
+
+
+RenderFn = Callable[[Path, Path, int, threading.Event, ClipOptions], List[RenderedVariant]]
 
 
 @dataclass
@@ -178,10 +230,19 @@ def _finals_of(store: S3Store, keys: OutputKeys) -> List[str]:
     return [o.key for o in store.list(f"{keys.folder}/v") if pattern.match(o.key)]
 
 
-def write_status(store: S3Store, keys: OutputKeys, state: str, source: ObjectInfo, **fields) -> None:
-    """``status.json`` of a clip, read by the CRM: processing, waiting, done or failed."""
-    data = {"state": state, "clip_id": (source.metadata or {}).get("clip-id") or None,
+def write_status(store: S3Store, keys: OutputKeys, state: str, source: ObjectInfo, attempts: int = 1,
+                 **fields) -> None:
+    """``status.json`` of a clip: processing, waiting, done or failed.
+
+    ``state``/``clip_id`` are read by the CRM; ``status``/``clipId``/``attempts``/``reason`` by the Swiper,
+    which knows processing, failed and done (a clip waiting for the speech server is still processing).
+    """
+    clip_id = (source.metadata or {}).get("clip-id") or None
+    data = {"status": "processing" if state == "waiting" else state, "clipId": clip_id, "attempts": attempts,
+            "state": state, "clip_id": clip_id,
             "source": {"key": source.key, "etag": source.etag}, "updated": _now(), **fields}
+    if "reason" not in data and "error" in data:
+        data["reason"] = data["error"]
     try:
         store.put_json(keys.status, data)
     except Exception:  # noqa: BLE001 - the status is informative, the manifest is the truth
@@ -198,7 +259,7 @@ def _delete_quietly(store: S3Store, keys) -> None:
 
 def process_clip(store: S3Store, source: ObjectInfo, settings: Settings, render: RenderFn, work: Path,
                  log: Callable[[str], None], cancel: Optional[threading.Event] = None,
-                 unique: bool = False) -> Optional[dict]:
+                 unique: bool = False, attempt: int = 1) -> Optional[dict]:
     """Render and publish the versions of one clip. Returns the manifest, or None when the source moved."""
     cancel = cancel or threading.Event()
     count = settings.watch_variants
@@ -213,7 +274,11 @@ def process_clip(store: S3Store, source: ObjectInfo, settings: Settings, render:
         _delete_quietly(store, [keys.status])
         log(f"  {source.key}: gone before download, skipped.")
         return None
-    write_status(store, keys, "processing", info, started=_now(), app_version=__version__)
+    # Written first: while it is missing the Swiper may still take the clip back to to_sort/.
+    write_status(store, keys, "processing", info, attempt, started=_now(), app_version=__version__)
+    options = clip_options(info.metadata)
+    for note in options.notes:
+        log(f"  {source.key}: {note}")
     work.mkdir(parents=True, exist_ok=True)
     local = work / f"source{posixpath.splitext(info.key)[1].lower()}"
     try:
@@ -225,9 +290,14 @@ def process_clip(store: S3Store, source: ObjectInfo, settings: Settings, render:
             return None
         raise
     log(f"  downloaded {info.size / 1e6:.1f} MB, rendering {count} versions...")
-    variants = render(local, work, count, cancel)
+    variants = render(local, work, count, cancel, options)
     if len(variants) != count:
         raise RuntimeError(f"rendered {len(variants)} versions instead of {count}")
+    current = store.head(info.key)
+    if current is None or current.etag != info.etag:
+        _delete_quietly(store, [keys.status])
+        log(f"  {source.key}: taken back or replaced during rendering, versions dropped.")
+        return None
 
     clip_id = info.metadata.get("clip-id") or None
     entries: List[dict] = []
@@ -256,6 +326,7 @@ def process_clip(store: S3Store, source: ObjectInfo, settings: Settings, render:
             if final is None or final.size != entry["size"]:
                 raise RuntimeError(f"{entry['key']}: copy check failed")
         manifest = {
+            "version": MANIFEST_VERSION, "clipId": clip_id,
             "manifest_version": MANIFEST_VERSION, "clip_id": clip_id,
             "source": {"key": info.key, "etag": info.etag, "size": info.size,
                        "last_modified": info.last_modified.isoformat() if info.last_modified else None},
@@ -264,10 +335,13 @@ def process_clip(store: S3Store, source: ObjectInfo, settings: Settings, render:
             "captions": all(v.captions for v in variants),
             "variants": entries, "app_version": __version__, "created": _now(),
             "stt": {"url": settings.stt_url, "model": settings.stt_model},
+            "montage_mode": options.mode, "stream_id": options.stream_id or None,
+            "regions": {"webcam": options.facecam or None, "stream": options.stream_area or None,
+                        "source": "swiper" if options.facecam or options.stream_area else "auto"},
         }
         store.put_json(keys.manifest, manifest)
         published = True
-        write_status(store, keys, "done", info, manifest=keys.manifest, versions=keys.final,
+        write_status(store, keys, "done", info, attempt, manifest=keys.manifest, versions=keys.final,
                      captions=manifest["captions"])
         return manifest
     finally:
@@ -306,6 +380,10 @@ class WatchState:
     def clear(self, key: str) -> None:
         if self.data.pop(key, None) is not None:
             self._save()
+
+    def failures(self, info: ObjectInfo) -> int:
+        entry = self.data.get(info.key)
+        return int(entry.get("failures", 0)) if entry and entry.get("etag") == info.etag else 0
 
     def parked(self, info: ObjectInfo, max_failures: int) -> bool:
         entry = self.data.get(info.key)
@@ -362,8 +440,9 @@ class Watcher:
             shutil.rmtree(work, ignore_errors=True)
             try:
                 # Stopping waits for the clip in progress: its render is never cancelled half way.
+                attempt = self.state.failures(source) + 1
                 manifest = process_clip(self.store, source, s, self.render, work, self.log, threading.Event(),
-                                        unique)
+                                        unique, attempt)
             except Cancelled:
                 summary.pending += 1
                 break
@@ -372,17 +451,19 @@ class Watcher:
                 if isinstance(exc, SpeechServerUnavailable) and not self._speech_server_answers():
                     summary.pending += 1
                     self.log(f"Speech server unavailable, {source.key} stays in the queue: {exc}")
-                    write_status(self.store, keys, "waiting", source, reason=f"speech server unavailable: {exc}")
+                    write_status(self.store, keys, "waiting", source, attempt,
+                                 reason=f"speech server unavailable: {exc}")
                     break
                 if is_transient(exc):
                     summary.pending += 1
                     self.log(f"Network or storage error, {source.key} will be retried: {reason}")
-                    write_status(self.store, keys, "waiting", source, reason=f"network or storage error: {reason}")
+                    write_status(self.store, keys, "waiting", source, attempt,
+                                 reason=f"network or storage error: {reason}")
                     break
                 failures = self.state.record_failure(source, exc)
                 summary.failed += 1
                 self.log(f"FAILED {source.key} ({failures}/{s.watch_max_failures}): {reason}")
-                write_status(self.store, keys, "failed", source, error=reason, failures=failures,
+                write_status(self.store, keys, "failed", source, failures, error=reason, failures=failures,
                              parked=failures >= s.watch_max_failures)
             else:
                 if manifest is None:
@@ -513,9 +594,16 @@ def default_render_fn(settings: Settings, log: Callable[[str], None]) -> RenderF
     from .reporting import Reporter
     from .variants import variant_presets
 
-    def render(source: Path, work: Path, count: int, cancel: threading.Event) -> List[RenderedVariant]:
-        s = Settings.from_dict(settings.to_dict())
-        s.whole_clip, s.transcriber, s.shorts_jump_cuts, s.captions = True, "http", True, True
+    def render(source: Path, work: Path, count: int, cancel: threading.Event,
+               options: Optional[ClipOptions] = None) -> List[RenderedVariant]:
+        options = options or ClipOptions()
+        s = watch_settings(settings, options)
+        if options.facecam:
+            log(f"  webcam from the Swiper: {options.facecam}")
+        if options.stream_area:
+            log(f"  stream area from the Swiper: {options.stream_area}")
+        if options.mode == "full":
+            log("  montage mode full: the whole clip, pauses kept")
         pipeline = Pipeline(str(source), s, str(work / "out"), Reporter(log, None, cancel))
         project = pipeline.analyze()
         has_facecam = bool(project.effective_settings(s).facecam.strip())
