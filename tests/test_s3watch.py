@@ -385,3 +385,48 @@ def test_webhook_failure_does_not_undo_publish(store, tmp_path):
         assert len(watcher.webhook.pending()) == 1
     finally:
         crm.close()
+
+
+# Broadcast folders (S3 layout contract of the Autoclipper and the Swiper, 2026-11-24):
+#   montage/<streamer>/<broadcast>/<clip>.mp4          source (swipe right)
+#   montage/<streamer>/<broadcast>/<clip>/uniqalized/  written by this service
+BROADCAST = "324159870123_2026-11-20_18-02"
+NESTED = f"montage/buster/{BROADCAST}/2026-11-20_18-30-12_laugh_ab12.mp4"
+
+
+def test_source_key_in_a_broadcast_folder():
+    assert is_source_key(NESTED, "montage/")
+    assert not is_source_key(f"montage/buster/{BROADCAST}/2026-11-20_18-30-12_laugh_ab12/uniqalized/v1.mp4",
+                             "montage/")
+    assert not is_source_key(f"montage/buster/{BROADCAST}/clip/uniqalized/.partial/v1.mp4", "montage/")
+    assert not is_source_key("montage/buster/uniqalized/clip.mp4", "montage/"), "never the versions folder"
+    assert not is_source_key("montage/buster/.partial/clip.mp4", "montage/")
+    assert not is_source_key(f"montage/buster/{BROADCAST}/x/y.mp4", "montage/"), "no deeper than the broadcast"
+
+
+def test_output_keys_next_to_a_clip_in_a_broadcast_folder():
+    k = output_keys(NESTED, "uniqalized", 3, prefix="montage/")
+    folder = f"montage/buster/{BROADCAST}/2026-11-20_18-30-12_laugh_ab12/uniqalized"
+    assert k.folder == folder
+    assert k.final == [f"{folder}/v{i}.mp4" for i in (1, 2, 3)]
+    assert k.partial[0] == f"{folder}/.partial/v1.mp4"
+    assert (k.manifest, k.status) == (f"{folder}/manifest.json", f"{folder}/status.json")
+    legacy = output_keys(SOURCE, "uniqalized", 3, prefix="montage/")
+    assert legacy.folder == "montage/buster/uniqalized/2026-11-20_reaction", "old clips keep their folder"
+    assert output_keys(NESTED.replace(".mp4", ".mov"), "uniqalized", 3, unique=True, prefix="montage/").folder \
+        == f"montage/buster/{BROADCAST}/2026-11-20_18-30-12_laugh_ab12.mov/uniqalized"
+
+
+def test_watcher_publishes_a_broadcast_clip_and_the_old_layout(store, tmp_path):
+    put_source(store, NESTED, clip_id="nested-1")
+    put_source(store, SOURCE, clip_id="legacy-1")
+    watcher, _logs = make_watcher(store, tmp_path, FakeRender())
+    assert watcher.run_once(threading.Event()).done == 2
+    nested = output_keys(NESTED, "uniqalized", 3, prefix="montage/")
+    legacy = output_keys(SOURCE, "uniqalized", 3, prefix="montage/")
+    assert store.get_json(nested.manifest)["clip_id"] == "nested-1" and state(store, nested) == "done"
+    assert store.get_json(legacy.manifest)["clip_id"] == "legacy-1"
+    assert all(store.head(key) for key in nested.final)
+    fresh, _ = make_watcher(store, tmp_path / "again", FakeRender())
+    summary = fresh.run_once(threading.Event())
+    assert (summary.done, summary.skipped) == (0, 2), "versions are never taken for new clips"
