@@ -12,7 +12,6 @@ from auto_video_editor.ffmpeg import probe
 from auto_video_editor.pipeline import Pipeline
 from auto_video_editor.reporting import Reporter
 from auto_video_editor.settings import Settings
-from auto_video_editor.timeline import total_duration
 from auto_video_editor.variants import VariantSpec, speed_words, variant_presets
 
 
@@ -43,7 +42,7 @@ def test_every_version_has_its_own_caption_color():
 
 def test_presets_follow_the_spec_table():
     v1, v2, v3 = variant_presets(3, True)
-    assert (v1.hook, v2.hook, v3.hook) == (False, True, False)
+    assert all("hook" not in s.to_dict() for s in (v1, v2, v3)), "no version opens with a teaser"
     assert (v1.speed, v2.speed, v3.speed) == (1.0, 1.02, 0.98)
     assert (v1.zoom, v2.zoom, v3.zoom) == (1.0, 1.03, 1.05)
     assert v2.shift < 0 < v3.shift
@@ -78,23 +77,25 @@ def test_three_variants_differ(tmp_path, monkeypatch):
         "-c:a", "aac", "-metadata", "creation_time=2020-01-01T00:00:00Z", "-shortest", str(src)], check=True)
     monkeypatch.setattr("auto_video_editor.pipeline.cache_dir", lambda: tmp_path / "cache")
     monkeypatch.setattr("auto_video_editor.settings.cache_dir", lambda: tmp_path / "cache")
-    settings = Settings(transcriber="none", whole_clip=True, shorts_jump_cuts=True, facecam="0,0,0.25,0.3",
-                        encoder="libx264", quality="draft", use_cache=False)
+    settings = Settings(transcriber="none", whole_clip=True, shorts_jump_cuts=True, shorts_hook=True,
+                        facecam="0,0,0.25,0.3", encoder="libx264", quality="draft", use_cache=False)
     pipeline = Pipeline(str(src), settings, str(tmp_path / "out"), Reporter(lambda _m: None, lambda *_: None))
     project = pipeline.analyze()
     outputs = []
     specs = variant_presets(3, True)
     seen = []
     original = Pipeline._render_one_short
+    short = project.shorts[0]
+    short.hook = [(12.0, 15.0)]
 
     def spy(self, project, m, path, renderer, work, ranges, captions_name, layout, *args, **kwargs):
         seen.append((layout, self.settings.caption_text_color, self.settings.caption_speaker_colors))
+        assert ranges[0][0] == pytest.approx(short.pieces(True)[0][0]), "no version opens with a teaser"
         return original(self, project, m, path, renderer, work, ranges, captions_name, layout, *args, **kwargs)
 
     monkeypatch.setattr(Pipeline, "_render_one_short", spy)
-    short = project.shorts[0]
-    edited = total_duration(short.ranges(True))
-    expected = [(edited + (total_duration(short.hook) if spec.hook else 0.0)) / spec.speed for spec in specs]
+    edited = short.edited_duration(True)
+    expected = [edited / spec.speed for spec in specs]
     for spec in specs:
         path, captions = pipeline.render_variant(project, spec, tmp_path / "out" / f"v{spec.index}.mp4")
         assert captions is False, "no transcript, no captions"
@@ -108,7 +109,7 @@ def test_three_variants_differ(tmp_path, monkeypatch):
                               capture_output=True, text=True, check=True).stdout
         assert "2020-01-01" not in tags, "source metadata must not leak into a version"
     for got, want in zip(durations, expected):
-        assert got == pytest.approx(want, abs=0.2), "same cuts in every version, only hook and speed differ"
+        assert got == pytest.approx(want, abs=0.2), "same cuts in every version, only the speed differs"
     hashes = {hashlib.md5(p.read_bytes()).hexdigest() for p in outputs}
     assert len(hashes) == 3
     assert [row[0] for row in seen] == ["split"] * 3

@@ -821,7 +821,8 @@ class Pipeline:
         s.caption_style, s.caption_color, s.caption_position = spec.caption_style, spec.caption_color, spec.caption_position
         # The color tells the versions apart: per-speaker colors would override it.
         s.caption_text_color, s.caption_speaker_colors = spec.caption_text_color, False
-        s.shorts_hook, s.quality = spec.hook, spec.quality
+        # A version never opens with a teaser, whatever the user's manual-mode setting says.
+        s.shorts_hook, s.quality = False, spec.quality
         self.settings = s
         output = Path(output)
         work = output.parent / f".work-{output.stem}"
@@ -836,9 +837,7 @@ class Pipeline:
             env = self._envelope or self._cached_envelope(info)
             if env is not None:
                 m.keep = self._jump_cut_ranges(m, env, is_short=True)
-            ranges = m.ranges(s.shorts_jump_cuts)
-            if s.shorts_hook and m.hook:
-                ranges = list(m.hook) + ranges
+            ranges = m.pieces(s.shorts_jump_cuts)
             facecam = s.facecam_rect() if s.facecam.strip() else None
             layout = spec.layout if (spec.layout != "split" or facecam) else "blur"
             output.parent.mkdir(parents=True, exist_ok=True)
@@ -850,7 +849,7 @@ class Pipeline:
             extra = ["-g", str(spec.gop), "-map_metadata", "-1", "-metadata", f"comment={uuid.uuid4().hex}",
                      "-metadata", f"creation_time={stamp}"]
             self.log(f"Version {spec.index}: {layout} layout, {spec.caption_style} captions {spec.caption_position}"
-                     f"{', hook' if s.shorts_hook and m.hook else ''}, speed {spec.speed:g}, zoom {spec.zoom:g}.")
+                     f", speed {spec.speed:g}, zoom {spec.zoom:g}.")
             _layout, _x, words = self._render_one_short(
                 project, m, output, renderer, work, ranges, f"v{spec.index}.ass", layout, facecam, adaptive=False,
                 speed=spec.speed, game_zoom=spec.zoom, game_shift=spec.shift, split_top=spec.split_top,
