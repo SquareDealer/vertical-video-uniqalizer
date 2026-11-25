@@ -5,6 +5,7 @@ Pieces are ``(source_start, source_end, speed)``. This module plans them; ``Rend
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -12,13 +13,19 @@ import numpy as np
 from .audio import AudioEnvelope
 from .glossary import is_laughter
 from .moments import normalize_text
-from .timeline import Piece, Range, merge_ranges, subtract_ranges
+from .timeline import Piece, Range, merge_ranges, pieces_duration, subtract_ranges
+from .transcribe import Transcript
 
 POSITIVE_THRESHOLD = 0.5   # P(positive) from which a second counts as laughter
 WORD_PAD = 0.1             # seconds kept around every word
 CUT_MARGIN = 0.15          # seconds kept at the edges of a cut
 MIN_PIECE = 0.25           # shorter kept ranges are dropped
 MIN_FAST = 0.5             # shorter parts of a wordless passage are not sped up
+SEARCH_BEFORE = 30.0       # the chat reacts late: the joke is up to this long before the trigger...
+SEARCH_AFTER = 3.0         # ...and at most this long after it
+ANCHOR_REACH = 3.0         # a phrase ending this close before the peak is the joke itself
+ANCHOR_FALLBACK = 2.0      # no speech near the peak: the joke starts this long before it
+MIN_OUTPUT = 5.0           # less than this is left after the cuts: play the clip uncut
 
 
 def _span(word) -> Tuple[float, float]:
@@ -136,3 +143,176 @@ def plan_pieces(start: float, end: float, env: AudioEnvelope, words: Sequence, m
             else:
                 pieces.append((lo, hi, speed))
     return pieces
+
+
+# -- peak, anchor, lead-in ---------------------------------------------------------------------
+
+def search_window(duration: float, trigger: Optional[float]) -> Tuple[float, float]:
+    """Where the funny moment is searched: before the chat trigger, or in the whole clip without one."""
+    if trigger is None:
+        return 0.0, float(duration)
+    return max(0.0, trigger - SEARCH_BEFORE), min(float(duration), trigger + SEARCH_AFTER)
+
+
+def find_peak(score: np.ndarray, window: Tuple[float, float], duration: float) -> float:
+    """Middle of the best second inside ``window`` (the earliest on a tie)."""
+    n = int(np.asarray(score).size)
+    if n == 0:
+        return duration / 2.0
+    lo = min(n - 1, max(0, int(np.floor(window[0]))))
+    hi = min(n, max(lo + 1, int(np.ceil(window[1]))))
+    best = lo + int(np.argmax(np.asarray(score)[lo:hi]))
+    return min(best + 0.5, float(duration))
+
+
+def find_anchor(peak: float, segments: Sequence) -> float:
+    """Start of the joke: the phrase around the peak, or the one that ended just before it."""
+    containing = [seg for seg in segments if seg.start <= peak <= seg.end]
+    if containing:
+        return float(max(seg.start for seg in containing))
+    before = [seg for seg in segments if seg.end < peak and peak - seg.end <= ANCHOR_REACH]
+    if before:
+        return float(max(before, key=lambda seg: seg.end).start)
+    return max(0.0, peak - ANCHOR_FALLBACK)
+
+
+def output_between(pieces: Sequence[Piece], a: float, b: float) -> float:
+    """Seconds of finished video the pieces give between source times ``a`` and ``b``."""
+    total = 0.0
+    for start, end, speed in pieces:
+        lo, hi = max(start, a), min(end, b)
+        if hi > lo:
+            total += (hi - lo) / speed
+    return total
+
+
+def clip_pieces(pieces: Sequence[Piece], a: float, b: float) -> List[Piece]:
+    result: List[Piece] = []
+    for start, end, speed in pieces:
+        lo, hi = max(start, a), min(end, b)
+        if hi - lo > 1e-9:
+            result.append((lo, hi, speed))
+    return result
+
+
+def choose_start(pieces: Sequence[Piece], anchor: float, segments: Sequence, words: Sequence,
+                 lead_in_min: float, lead_in_max: float) -> Tuple[float, bool]:
+    """Where the video starts: ``lead_in_min`` seconds of finished video before the joke, on a phrase.
+
+    Returns ``(start, lead_in_short)``; ``lead_in_short`` when the file has less lead-in than that.
+    """
+    first = pieces[0][0]
+    if output_between(pieces, first, anchor) < lead_in_min:
+        return first, True
+    remaining, t = lead_in_min, first
+    for start, end, speed in reversed(pieces):
+        top = min(end, anchor)
+        if top <= start:
+            continue
+        seconds = (top - start) / speed
+        if seconds >= remaining:
+            t = top - remaining * speed
+            break
+        remaining -= seconds
+    phrase = next((seg for seg in segments if seg.start < t < seg.end), None)
+    if phrase is not None and output_between(pieces, phrase.start, anchor) <= lead_in_max:
+        t = float(phrase.start)
+    else:
+        word = next((w for w in words if _span(w)[0] < t < _span(w)[1]), None)
+        if word is not None:
+            t = _span(word)[0]
+    return max(first, t), False
+
+
+@dataclass
+class EditPlan:
+    start: float
+    end: float
+    peak: float
+    anchor: float
+    pieces: List[Piece] = field(default_factory=list)     # empty = play start..end uncut
+    lead_in: float = 0.0
+    lead_in_short: bool = False
+    search_window: Tuple[float, float] = (0.0, 0.0)
+    trigger_offset: Optional[float] = None
+    cuts: int = 0
+    speedups: List[Piece] = field(default_factory=list)
+    emotion: Optional[dict] = None
+
+    def to_dict(self) -> dict:
+        """The ``edit`` field of ``manifest.json``: why the video starts and ends where it does."""
+        return {
+            "peak": round(self.peak, 2), "anchor": round(self.anchor, 2),
+            "start": round(self.start, 2), "end": round(self.end, 2),
+            "lead_in": round(self.lead_in, 2), "lead_in_short": bool(self.lead_in_short),
+            "search_window": [round(self.search_window[0], 2), round(self.search_window[1], 2)],
+            "trigger_offset": None if self.trigger_offset is None else round(self.trigger_offset, 2),
+            "cuts": int(self.cuts),
+            "speedups": [[round(a, 2), round(b, 2), round(sp, 2)] for a, b, sp in self.speedups],
+            "emotion": self.emotion,
+        }
+
+
+def _snap_end(end: float, words: Sequence) -> float:
+    """An end that lands inside a word moves to the start of that word."""
+    for word in words:
+        ws, we = _span(word)
+        if ws < end < we:
+            return ws
+    return end
+
+
+def plan_edit(*, duration: float, score: np.ndarray, env: AudioEnvelope, transcript: Optional[Transcript],
+              positive: Optional[np.ndarray] = None, emotion_model: str = "", trigger: Optional[float] = None,
+              jump_cuts: bool = True, min_silence: float = 0.8, threshold: Optional[float] = None,
+              lead_in_min: float = 10.0, lead_in_max: float = 20.0, quiet_cut_max: float = 3.0,
+              quiet_speed: float = 2.0, long_after: float = 180.0, long_cut: float = 90.0) -> EditPlan:
+    """Plan the whole-clip edit: lead-in -> joke -> reaction, with dead weight cut or sped up."""
+    if trigger is not None and not 0.0 <= trigger <= duration:
+        trigger = None
+    window = search_window(duration, trigger)
+    peak = find_peak(score, window, duration)
+    segments = list(transcript.segments) if transcript else []
+    words = list(transcript.words()) if transcript else []
+    anchor = find_anchor(peak, segments)
+
+    protected = protected_ranges(words, positive)
+    # The reaction stays even when it has no recognized words (laughter is rarely written down).
+    tail = peak + 3.0
+    for ps, pe in protected:
+        if ps <= tail <= pe:
+            tail = pe
+    end0 = min(duration, max(max(_span(w)[1] for w in words) + 0.5, tail)) if words else float(duration)
+
+    uncut = [(0.0, end0, 1.0)]
+    if jump_cuts:
+        all_pieces = plan_pieces(0.0, end0, env, words, min_silence, threshold, protected=protected,
+                                 speech_rule=bool(words), quiet_cut_max=quiet_cut_max, quiet_speed=quiet_speed)
+    else:
+        all_pieces = uncut
+
+    def trim(source: List[Piece]) -> Tuple[float, float, bool]:
+        start, short = choose_start(source, anchor, segments, words, lead_in_min, lead_in_max)
+        end = end0
+        if end - start > long_after:
+            end = _snap_end(min(end0, max(start + long_cut, peak + 3.0)), words)
+        return start, end, short
+
+    start, end, short = trim(all_pieces)
+    pieces = clip_pieces(all_pieces, start, end)
+    if pieces_duration(pieces) < min(MIN_OUTPUT, end0):
+        start, end, short = trim(uncut)    # too little left after the cuts: play the clip uncut
+        pieces = []
+    elif pieces and pieces[0][0] > start:
+        start = pieces[0][0]               # the phrase start fell into a cut: the video starts at its sound
+
+    lead_in = output_between(pieces or [(start, end, 1.0)], start, anchor)
+    cuts = sum(1 for prev, nxt in zip(pieces, pieces[1:]) if nxt[0] - prev[1] > 1e-6)
+    emotion = None
+    if positive is not None:
+        index = int(peak)
+        value = float(positive[index]) if 0 <= index < len(positive) else 0.0
+        emotion = {"model": emotion_model, "peak_positive": round(value, 2)}
+    return EditPlan(start=start, end=end, peak=peak, anchor=anchor, pieces=pieces, lead_in=lead_in,
+                    lead_in_short=short, search_window=window, trigger_offset=trigger, cuts=cuts,
+                    speedups=[p for p in pieces if p[2] != 1.0], emotion=emotion)
