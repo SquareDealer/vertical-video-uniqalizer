@@ -170,3 +170,16 @@ def test_calm_talking_is_not_a_moment(envelope_factory):
     assert all(c.score < 20 for c in intro), "the calm intro must score far below the action"
     skipped = build_curve(env, None, 600, skip=(120, 0))
     assert skipped.raw[:120].max() == 0
+
+
+def test_funny_edit_settings_defaults_and_limits():
+    s = Settings()
+    assert (s.watch_emotion_url, s.emotion_url) == ("http://localhost:8092", "")
+    assert (s.lead_in_min, s.lead_in_max, s.quiet_cut_max, s.quiet_speed, s.trigger_offset) == (10.0, 20.0, 3.0, 2.0, -1.0)
+    assert s.validate() == []
+    assert any("quiet_speed" in e for e in s.with_value("quiet_speed", "3").validate())
+    assert any("quiet_speed" in e for e in s.with_value("quiet_speed", "1.1").validate())
+    assert any("lead_in_max" in e for e in s.with_value("lead_in_max", "5").validate())
+    assert Settings.from_dict({"quiet_cut_max": "2.5"}).quiet_cut_max == 2.5
+    from auto_video_editor.pipeline import ANALYSIS_KEYS
+    assert {"emotion_url", "lead_in_min", "lead_in_max", "quiet_cut_max", "quiet_speed", "trigger_offset"} <= set(ANALYSIS_KEYS)

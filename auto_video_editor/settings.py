@@ -112,6 +112,13 @@ class Settings:
     whole_clip_max: float = 180.0   # longer clips are cut to their best fragment...
     whole_clip_cut: float = 90.0    # ...of at most this length
     whole_clip_full: bool = False   # the whole length, never trimmed (montage-mode full of the Swiper)
+    # Funny moment edit of a whole clip: lead-in, emotions, wordless passages (funny.py).
+    emotion_url: str = ""           # emotion server (services/emotion); empty = no emotion signal (manual mode)
+    lead_in_min: float = 10.0       # seconds of finished video before the joke
+    lead_in_max: float = 20.0       # never keep more lead-in than this
+    quiet_cut_max: float = 3.0      # a wordless passage up to this long is cut...
+    quiet_speed: float = 2.0        # ...a longer one is played at this speed (1.25-2.0)
+    trigger_offset: float = -1.0    # seconds from the clip start where the chat fired (per clip); < 0 = unknown
     shorts_layout: str = "auto"
     shorts_hook: bool = False      # open each short with its best 3 seconds, then play it from the start
     facecam: str = ""  # "x,y,w,h" as fractions of the frame, used by the split layout
@@ -144,6 +151,7 @@ class Settings:
     watch_interval: int = 60
     watch_max_failures: int = 3
     watch_threads: int = 4      # ffmpeg threads per process in auto mode, at a lower priority (0 = no limit)
+    watch_emotion_url: str = "http://localhost:8092"   # emotion server of auto mode; empty = none
     language: str = ""  # empty = auto-detect
     beam_size: int = 5
     vocabulary: List[str] = field(default_factory=list)  # names/jargon the transcriber should know
@@ -301,6 +309,12 @@ class Settings:
         check_range("watch_interval", 10, 3600)
         check_range("watch_max_failures", 1, 100)
         check_range("watch_threads", 0, 64)
+        check_range("lead_in_min", 0, 60)
+        check_range("lead_in_max", 0, 120)
+        if self.lead_in_max < self.lead_in_min:
+            errors.append("lead_in_max must not be below lead_in_min")
+        check_range("quiet_cut_max", 0, 30)
+        check_range("quiet_speed", 1.25, 2.0)
         check_range("audio_bitrate", 64, 320)
         if not re.fullmatch(r"#?[0-9a-fA-F]{6}", self.caption_color.strip()):
             errors.append("caption_color must be a hex color such as #FFE600")

@@ -47,6 +47,7 @@ ANALYSIS_KEYS = (
     "weight_exclamations", "skip_start", "skip_end", "auto_trim", "vocabulary", "vocabulary_packs", "auto_vocabulary",
     "profanity_prompt", "censor_profanity", "censor_words", "diarize", "speaker_count",
     "whole_clip", "whole_clip_max", "whole_clip_cut", "whole_clip_full",
+    "emotion_url", "lead_in_min", "lead_in_max", "quiet_cut_max", "quiet_speed", "trigger_offset",
 )
 
 
