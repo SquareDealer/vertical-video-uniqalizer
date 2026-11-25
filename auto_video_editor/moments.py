@@ -12,11 +12,19 @@ import numpy as np
 
 from .audio import AudioEnvelope
 from .glossary import is_laughter
-from .timeline import Range, merge_ranges, subtract_ranges, total_duration
+from .timeline import Piece, Range, as_piece, merge_ranges, pieces_duration, subtract_ranges
 from .transcribe import Transcript
 
 LEAD_SECONDS = 6.0   # build-up kept before a peak
 TAIL_SECONDS = 3.0   # reaction kept after a peak
+
+
+def _keep_item(item: Sequence[float]) -> list:
+    a, b, speed = as_piece(item)
+    out = [round(a, 3), round(b, 3)]
+    if speed != 1.0:
+        out.append(round(speed, 3))
+    return out
 
 
 @dataclass
@@ -28,21 +36,25 @@ class Moment:
     text: str = ""
     reasons: List[str] = field(default_factory=list)
     selected: bool = True
-    keep: List[Range] = field(default_factory=list)   # source ranges left after jump cuts
+    keep: List[Piece] = field(default_factory=list)   # (start, end, speed) pieces left after the edit
     words: List[list] = field(default_factory=list)   # [[start, end, text, speaker], ...] in source time
     hook: List[Range] = field(default_factory=list)   # teaser played before a short (its best seconds)
+    edit: Optional[dict] = None                       # the edit plan of a whole clip (see funny.EditPlan)
 
     @property
     def duration(self) -> float:
         return self.end - self.start
 
-    def ranges(self, jump_cuts: bool) -> List[Range]:
+    def pieces(self, jump_cuts: bool) -> List[Piece]:
         if jump_cuts and self.keep:
-            return list(self.keep)
-        return [(self.start, self.end)]
+            return [as_piece(k) for k in self.keep]
+        return [(self.start, self.end, 1.0)]
+
+    def ranges(self, jump_cuts: bool) -> List[Range]:
+        return [(a, b) for a, b, _ in self.pieces(jump_cuts)]
 
     def edited_duration(self, jump_cuts: bool) -> float:
-        return total_duration(self.ranges(jump_cuts))
+        return pieces_duration(self.pieces(jump_cuts))
 
     def title(self, max_words: int = 7) -> str:
         words = re.sub(r"\s+", " ", self.text).strip().split(" ")
@@ -53,12 +65,15 @@ class Moment:
         return title + ("..." if len(words) > max_words else "")
 
     def to_dict(self) -> dict:
-        return {
+        data = {
             "start": round(self.start, 3), "end": round(self.end, 3), "score": round(self.score, 1),
             "peak": round(self.peak, 2), "text": self.text, "reasons": self.reasons,
-            "selected": self.selected, "keep": [[round(a, 3), round(b, 3)] for a, b in self.keep],
+            "selected": self.selected, "keep": [_keep_item(k) for k in self.keep],
             "words": self.words, "hook": [[round(a, 3), round(b, 3)] for a, b in self.hook],
         }
+        if self.edit is not None:
+            data["edit"] = self.edit
+        return data
 
     @classmethod
     def from_dict(cls, data: dict) -> "Moment":
@@ -66,9 +81,10 @@ class Moment:
             start=float(data["start"]), end=float(data["end"]), score=float(data.get("score", 0)),
             peak=float(data.get("peak", data["start"])), text=data.get("text", ""),
             reasons=list(data.get("reasons", [])), selected=bool(data.get("selected", True)),
-            keep=[(float(a), float(b)) for a, b in data.get("keep", [])],
+            keep=[as_piece(k) for k in data.get("keep", [])],
             words=[list(w) for w in data.get("words", [])],
             hook=[(float(a), float(b)) for a, b in data.get("hook", [])],
+            edit=data.get("edit"),
         )
 
 

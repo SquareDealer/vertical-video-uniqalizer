@@ -1,3 +1,5 @@
+import pytest
+
 from auto_video_editor.moments import (Moment, build_curve, compute_keep_ranges, find_candidates, pad_moments,
                                        plan_shorts, select_highlight)
 
@@ -75,3 +77,19 @@ def test_jump_cuts_remove_dead_air_but_keep_words(envelope_factory):
 
     keep_with_word = compute_keep_ranges(5, 20, env, words=[[11.0, 12.0, "hey"]], min_silence=0.8)
     assert any(a <= 11.0 and b >= 12.0 for a, b in keep_with_word)
+
+
+def test_moment_keep_has_speeds_and_old_projects_still_load():
+    m = Moment(10, 30, keep=[(10, 14), (16, 24, 2.0)])
+    assert m.pieces(True) == [(10.0, 14.0, 1.0), (16.0, 24.0, 2.0)]
+    assert m.ranges(True) == [(10.0, 14.0), (16.0, 24.0)]
+    assert m.pieces(False) == [(10, 30, 1.0)] and m.ranges(False) == [(10, 30)]
+    assert m.edited_duration(True) == pytest.approx(8.0) and m.edited_duration(False) == 20
+    data = m.to_dict()
+    assert data["keep"] == [[10, 14], [16, 24, 2.0]] and "edit" not in data
+    again = Moment.from_dict(data)
+    assert again.pieces(True) == m.pieces(True) and again.edit is None
+    old = Moment.from_dict({"start": 0, "end": 9, "keep": [[0, 4], [5, 9]], "hook": [[6, 8]]})
+    assert old.pieces(True) == [(0.0, 4.0, 1.0), (5.0, 9.0, 1.0)] and old.hook == [(6.0, 8.0)]
+    planned = Moment(0, 9, edit={"peak": 5.5})
+    assert Moment.from_dict(planned.to_dict()).edit == {"peak": 5.5}

@@ -1,7 +1,7 @@
 import pytest
 
-from auto_video_editor.timeline import (TimeMap, format_clock, format_srt_time, merge_ranges, parse_duration,
-                                        slugify, subtract_ranges, total_duration)
+from auto_video_editor.timeline import (TimeMap, as_piece, format_clock, format_srt_time, merge_ranges, parse_duration,
+                                        pieces_duration, slugify, subtract_ranges, total_duration)
 
 
 def test_merge_ranges_overlapping_and_gap():
@@ -48,3 +48,10 @@ def test_formatting():
     assert format_clock(5, always_hours=True) == "0:00:05"
     assert format_srt_time(3661.5) == "01:01:01,500"
     assert slugify("No way! Let's GO, c'est incroyable") == "no-way-lets-go-cest-incroyable"
+
+
+def test_pieces_carry_a_speed():
+    assert as_piece((1, 3)) == (1.0, 3.0, 1.0)
+    assert as_piece([1, 3, 2]) == (1.0, 3.0, 2.0)
+    assert pieces_duration([(0, 2), (2, 6, 2.0)]) == pytest.approx(4.0)
+    assert total_duration([(0, 2), (2, 6, 2.0)]) == 6, "source seconds, whatever the speed"

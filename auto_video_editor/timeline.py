@@ -7,6 +7,7 @@ import re
 from typing import Iterable, List, Optional, Sequence, Tuple
 
 Range = Tuple[float, float]
+Piece = Tuple[float, float, float]   # source start, source end, playback speed
 
 
 def merge_ranges(ranges: Iterable[Range], gap: float = 0.0) -> List[Range]:
@@ -36,8 +37,24 @@ def subtract_ranges(base: Range, cuts: Iterable[Range]) -> List[Range]:
     return keep
 
 
-def total_duration(ranges: Iterable[Range]) -> float:
-    return sum(max(0.0, b - a) for a, b in ranges)
+def as_piece(item: Sequence[float]) -> Piece:
+    """``(a, b)`` or ``(a, b, speed)`` -> ``(a, b, speed)``; a bare range plays at speed 1.0."""
+    speed = float(item[2]) if len(item) > 2 else 1.0
+    return float(item[0]), float(item[1]), speed
+
+
+def pieces_duration(items: Iterable[Sequence[float]]) -> float:
+    """Seconds of finished video the pieces give (speed applied)."""
+    total = 0.0
+    for item in items:
+        a, b, speed = as_piece(item)
+        total += max(0.0, b - a) / speed
+    return total
+
+
+def total_duration(ranges: Iterable[Sequence[float]]) -> float:
+    """Source seconds covered by the ranges (or pieces), whatever their speed."""
+    return sum(max(0.0, r[1] - r[0]) for r in ranges)
 
 
 def overlap(a: Range, b: Range) -> float:
