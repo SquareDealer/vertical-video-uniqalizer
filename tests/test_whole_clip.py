@@ -1,38 +1,20 @@
 """Whole-clip plan: one short = the clip without dead air (auto mode for TikTok)."""
 
 import shutil
-import subprocess
+import sys
+from pathlib import Path
 
 import pytest
 
-from auto_video_editor.ffmpeg import probe
-from auto_video_editor.pipeline import Pipeline
-from auto_video_editor.reporting import Reporter
-from auto_video_editor.settings import Settings
-from auto_video_editor.timeline import total_duration
+sys.path.insert(0, str(Path(__file__).parent))
+from _clips import _pipeline, _video  # noqa: E402
+
+from auto_video_editor.ffmpeg import probe  # noqa: E402
+from auto_video_editor.pipeline import Pipeline  # noqa: E402
+from auto_video_editor.timeline import total_duration  # noqa: E402
 from auto_video_editor.transcribe import SpeechServer, SpeechServerUnavailable
 
 pytestmark = pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not installed")
-
-
-def _video(path, duration, bursts=(), audio=True):
-    volume = "+".join(f"between(t,{a},{b})" for a, b in bursts) or "0"
-    cmd = ["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", f"testsrc2=size=320x180:rate=30:duration={duration}"]
-    if audio:
-        cmd += ["-f", "lavfi", "-i", f"sine=frequency=300:duration={duration}",
-                "-filter_complex", f"[1:a]volume='if({volume},1.0,0.02)':eval=frame[a]", "-map", "0:v", "-map", "[a]",
-                "-c:a", "aac"]
-    cmd += ["-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-shortest", str(path)]
-    subprocess.run(cmd, check=True)
-    return path
-
-
-def _pipeline(path, tmp_path, monkeypatch, **overrides):
-    monkeypatch.setattr("auto_video_editor.pipeline.cache_dir", lambda: tmp_path / "cache")
-    monkeypatch.setattr("auto_video_editor.settings.cache_dir", lambda: tmp_path / "cache")
-    settings = Settings(transcriber="none", whole_clip=True, shorts_jump_cuts=True, shorts_layout="crop",
-                        encoder="libx264", quality="draft", use_cache=False, **overrides)
-    return Pipeline(str(path), settings, str(tmp_path / "out"), Reporter(lambda _m: None, lambda *_: None))
 
 
 def test_whole_clip_gives_one_short_without_dead_air(tmp_path, monkeypatch):
@@ -43,7 +25,8 @@ def test_whole_clip_gives_one_short_without_dead_air(tmp_path, monkeypatch):
     short = project.shorts[0]
     assert short.keep, "dead air must be cut"
     assert total_duration(short.keep) < 22
-    assert short.keep[0][0] < 0.5
+    assert short.edit["lead_in"] == pytest.approx(10.0, abs=0.1), "the video starts a lead-in before the joke"
+    assert short.keep[0][0] == pytest.approx(short.edit["start"], abs=0.01)
 
 
 def test_whole_clip_without_audio(tmp_path, monkeypatch):
@@ -64,12 +47,21 @@ def test_whole_clip_tiny_clip_renders(tmp_path, monkeypatch):
 
 
 def test_long_clip_is_cut_to_best_fragment(tmp_path, monkeypatch):
-    video = _video(tmp_path / "long.mp4", 200, bursts=[(120, 126)])
+    video = _video(tmp_path / "long.mp4", 400, bursts=[(120, 126)])
     project = _pipeline(video, tmp_path, monkeypatch).analyze()
     assert len(project.shorts) == 1
     short = project.shorts[0]
     assert short.duration <= 90.5
     assert short.start <= 123 <= short.end, "the fragment holds the loud part"
+    assert short.edit["lead_in"] >= 0
+
+
+def test_clip_that_is_short_after_trimming_keeps_its_end(tmp_path, monkeypatch):
+    video = _video(tmp_path / "late.mp4", 200, bursts=[(120, 126)])
+    duration = probe(str(video)).duration
+    short = _pipeline(video, tmp_path, monkeypatch).analyze().shorts[0]
+    assert short.end == pytest.approx(duration, abs=0.1)
+    assert short.duration < 180
 
 
 def test_long_clip_without_peaks_falls_back_to_its_start(tmp_path, monkeypatch):
@@ -88,7 +80,7 @@ def test_whole_clip_peak_is_the_loudest_part(tmp_path, monkeypatch):
     video = _video(tmp_path / "peak.mp4", 20, bursts=[(14, 17)])
     project = _pipeline(video, tmp_path, monkeypatch).analyze()
     short = project.shorts[0]
-    assert 13 <= short.peak <= 18, "the hook must come from the best seconds, not the middle"
+    assert 13 <= short.peak <= 18, "the peak is the best second, not the middle"
 
 
 def test_full_mode_keeps_the_whole_long_clip(tmp_path, monkeypatch):
@@ -98,6 +90,7 @@ def test_full_mode_keeps_the_whole_long_clip(tmp_path, monkeypatch):
                         whole_clip_full=True).analyze()
     short = project.shorts[0]
     assert (short.start, short.end) == (0.0, pytest.approx(duration, abs=0.1)), "montage-mode full: never trimmed"
+    assert short.edit is None
 
 
 def test_full_mode_does_not_trim_around_the_words():

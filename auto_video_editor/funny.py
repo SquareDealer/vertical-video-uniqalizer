@@ -296,10 +296,14 @@ def plan_edit(*, duration: float, score: np.ndarray, env: AudioEnvelope, transcr
         end = end0
         if end - start > long_after:
             end = _snap_end(min(end0, max(start + long_cut, peak + 3.0)), words)
-        return start, end, short
+        return round(start, 3), round(end, 3), short   # milliseconds, as project.json stores them
+
+    def clipped(source: List[Piece], a: float, b: float) -> List[Piece]:
+        rounded = [(round(lo, 3), round(hi, 3), speed) for lo, hi, speed in clip_pieces(source, a, b)]
+        return [p for p in rounded if p[1] > p[0]]
 
     start, end, short = trim(all_pieces)
-    pieces = clip_pieces(all_pieces, start, end)
+    pieces = clipped(all_pieces, start, end)
     if pieces_duration(pieces) < min(MIN_OUTPUT, end0):
         start, end, short = trim(uncut)    # too little left after the cuts: play the clip uncut
         pieces = []

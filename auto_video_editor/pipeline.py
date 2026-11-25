@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import shutil
 import uuid
@@ -17,9 +18,12 @@ from typing import List, Optional, Tuple
 from . import __version__, publish, vision
 from .audio import AudioEnvelope, analyze_audio, media_fingerprint
 from .captions import build_ass, build_srt, remap_words, remap_words_sequence
+from .emotion import (EMOTION_HOP, EMOTION_WINDOW, EmotionServer, EmotionTrack, load_cached as load_emotions,
+                      save_cached as save_emotions)
 from .censor import censor_text, profanity_set
 from .exporters import write_chapters, write_edl, write_fcp_xml, write_moments_csv
 from .ffmpeg import MediaInfo, pick_encoder, probe, require_tools
+from .funny import plan_edit
 from .glossary import Pack, auto_packs, hashtags, hype_phrases, prompt_terms, resolve_packs
 from .insights import (VideoInsights, auto_layout, auto_model, auto_shorts_count, auto_target, auto_trim,
                        classify_content, describe_position, estimate_transcription, load_insights, save_insights,
@@ -31,8 +35,9 @@ from .variants import VariantSpec, speed_words
 from .reporting import Reporter
 from .settings import CONTENT_LABELS, Settings, cache_dir
 from .speakers import assign_speakers
-from .timeline import TimeMap, format_clock, format_tag, slugify, total_duration
-from .transcribe import HTTP_BACKEND, SpeechServer, Transcriber, Transcript, load_cached, resolve_backend, save_cached
+from .timeline import TimeMap, format_clock, format_tag, pieces_duration, slugify, total_duration
+from .transcribe import (HTTP_BACKEND, SAMPLE_RATE, SpeechServer, Transcriber, Transcript, _decode_pcm, load_cached,
+                         resolve_backend, save_cached)
 
 PROJECT_FILE = "project.json"
 PROJECT_VERSION = 2
@@ -186,7 +191,8 @@ class Pipeline:
         r = self.reporter
         backend = resolve_backend(s.transcriber)
         r.plan([("probe", 1), ("scan", 4), ("audio", 8), ("preview", 4 if backend else 0),
-                ("transcribe", 70 if backend else 0), ("moments", 3)])
+                ("transcribe", 70 if backend else 0), ("emotion", 6 if s.emotion_url.strip() else 0),
+                ("moments", 3)])
         auto: List[List[str]] = []
 
         r.stage("probe", "Reading media")
@@ -298,8 +304,13 @@ class Pipeline:
         if s.skip_start or s.skip_end:
             self.log(f"Ignoring the first {s.skip_start:.0f} s and the last {s.skip_end:.0f} s.")
 
+        track: Optional[EmotionTrack] = None
+        if s.emotion_url.strip() and info.has_audio:
+            track = self._load_emotions(info, s)
+        seconds = max(1, int(math.ceil(info.duration)))
         curve = build_curve(env, transcript, info.duration, s.keywords, s.score_weights(),
-                            skip=(s.skip_start, s.skip_end))
+                            skip=(s.skip_start, s.skip_end),
+                            emotion=track.score(seconds) if track is not None else None)
         if transcript is not None and s.censor_profanity:
             transcript = self._censor(transcript)
 
@@ -307,9 +318,10 @@ class Pipeline:
         min_clip = min(s.min_clip, max(2.0, info.duration / 4))
         max_clip = max(min_clip, s.max_clip)
         limit = max(40, int(s.target_for(info.duration) / min_clip * 3) + 30)
-        whole = s.whole_clip and (s.whole_clip_full or info.duration <= s.whole_clip_max)
-        candidates = [] if whole else find_candidates(curve, env, transcript, info.duration, min_clip, max_clip,
-                                                      limit, lead=s.context_before, tail=s.context_after)
+        # A whole clip is planned by plan_edit from the score curve: no candidate moments are searched.
+        candidates = [] if s.whole_clip else find_candidates(curve, env, transcript, info.duration, min_clip,
+                                                             max_clip, limit, lead=s.context_before,
+                                                             tail=s.context_after)
         if not candidates and not s.whole_clip:
             raise RuntimeError("No usable moments were found. Is the audio track silent?")
         weak = [c for c in candidates if c.score < s.min_score]
@@ -317,7 +329,7 @@ class Pipeline:
             candidates = [c for c in candidates if c.score >= s.min_score]
             self.log(f"Found {len(candidates)} strong moments ({len(weak)} weak ones below score "
                      f"{s.min_score:.0f} ignored).")
-        else:
+        elif not s.whole_clip:
             self.log(f"Found {len(candidates)} candidate moments.")
 
         if s.whole_clip:
@@ -353,17 +365,11 @@ class Pipeline:
                 self._attach_details(candidate, env, transcript)
         if s.whole_clip:
             highlight = []
-            if whole:
-                shorts = [self._whole_clip_moment(transcript, info.duration, curve, s.whole_clip_full)]
+            if s.whole_clip_full:
+                shorts = [self._whole_clip_moment(transcript, info.duration, curve, True)]
                 self.log(f"Whole clip: one vertical short of {format_clock(shorts[0].duration)} before cuts.")
             else:
-                shorts = plan_shorts(candidates, curve, transcript, env, info.duration, 1, min(20.0, s.whole_clip_cut),
-                                     s.whole_clip_cut, s.pad_before, s.pad_after) if candidates else []
-                if not shorts:  # no peak at all: the clip was still chosen by a person, keep its start
-                    shorts = [Moment(start=0.0, end=min(info.duration, s.whole_clip_cut), score=50.0,
-                                     peak=min(info.duration, s.whole_clip_cut) / 2, reasons=["clip start"])]
-                self.log(f"Clip longer than {format_clock(s.whole_clip_max)}: best fragment of at most "
-                         f"{format_clock(s.whole_clip_cut)} kept.")
+                shorts = [self._funny_moment(info, curve, env, transcript, track, s)]
         else:
             highlight = select_highlight(candidates, target, info.duration, s.pad_before, s.pad_after,
                                          jump_cuts=s.jump_cuts, diversity=s.diversity)
@@ -375,7 +381,9 @@ class Pipeline:
             self._attach_details(moment, env, transcript)
         for short in shorts:
             self._attach_details(short, env, transcript, is_short=True)
-            short.hook = compute_hook(short.start, short.end, short.peak, short.words)
+            # A planned whole clip has its own cuts and no teaser; manual shorts keep theirs.
+            short.hook = [] if short.edit is not None else compute_hook(short.start, short.end, short.peak,
+                                                                        short.words)
 
         project = Project(
             input=self.input_path, output_dir=str(self.output_dir), media=info,
@@ -474,7 +482,69 @@ class Pipeline:
             words = transcript.words_between(moment.start, moment.end)
             moment.words = [[round(w.start, 3), round(w.end, 3), w.text, w.speaker] for w in words]
             moment.text = transcript.text_between(moment.start, moment.end)
-        moment.keep = self._jump_cut_ranges(moment, env, is_short)
+        if moment.edit is None:  # a planned whole clip keeps the pieces of its plan
+            moment.keep = self._jump_cut_ranges(moment, env, is_short)
+
+    def _funny_moment(self, info: MediaInfo, curve, env: AudioEnvelope, transcript: Optional[Transcript],
+                      track: Optional[EmotionTrack], s: Settings) -> Moment:
+        """Plan the whole clip as lead-in -> joke -> reaction (see funny.plan_edit)."""
+        n = len(curve.score)
+        trigger = s.trigger_offset if s.trigger_offset >= 0 else None
+        plan = plan_edit(
+            duration=info.duration, score=curve.score, env=env, transcript=transcript,
+            positive=track.per_second("positive", n) if track is not None else None,
+            emotion_model=track.model if track is not None else "", trigger=trigger,
+            jump_cuts=s.shorts_jump_cuts, min_silence=s.min_silence,
+            threshold=s.silence_threshold if s.silence_threshold < 0 else None,
+            lead_in_min=s.lead_in_min, lead_in_max=s.lead_in_max, quiet_cut_max=s.quiet_cut_max,
+            quiet_speed=s.quiet_speed, long_after=s.whole_clip_max, long_cut=s.whole_clip_cut)
+        has_words = transcript is not None and any(True for _ in transcript.words())
+        self.log(f"Funny moment: peak {plan.peak:.1f} s, joke from {plan.anchor:.1f} s, video from {plan.start:.1f} s "
+                 f"(lead-in {plan.lead_in:.1f} s{', short' if plan.lead_in_short else ''}), {plan.cuts} cuts, "
+                 f"{len(plan.speedups)} sped-up passages."
+                 + ("" if has_words else ", no words recognized: wordless passages left as they are"))
+        if trigger is not None and plan.trigger_offset is None:
+            self.log(f"Chat trigger at {trigger:.1f} s is outside the clip ({info.duration:.1f} s): ignored, "
+                     "the whole clip is searched.")
+        return Moment(plan.start, plan.end, 100.0, plan.peak, reasons=["whole clip"], keep=plan.pieces,
+                      edit=plan.to_dict())
+
+    def _load_emotions(self, info: MediaInfo, s: Settings) -> EmotionTrack:
+        """Emotions of the listened audio track, from the cache or from the emotion server."""
+        r = self.reporter
+        server = EmotionServer(s.emotion_url)
+        track_no = self._track(info, "audio_track")
+        key = hashlib.sha1(server.url.encode("utf-8")).hexdigest()[:8]
+        path = self._cache_file("emotions", f"{media_fingerprint(info.path)}-{key}"
+                                            f"{'' if track_no == 1 else f'-t{track_no}'}"
+                                            f"-w{EMOTION_WINDOW:g}-h{EMOTION_HOP:g}-v1.json")
+        if s.use_cache and path.exists():
+            cached = load_emotions(path)
+            if cached is not None:
+                self.log(f"Emotions: loaded from cache ({len(cached.windows)} windows).")
+                return cached
+        self.log(f"Emotion server: {server.describe()} — {server.check()}.")
+        progress = r.stage("emotion", "Listening to emotions")
+        chunk = 600.0
+        windows, model, labels = [], "", []
+        offset = 0.0
+        while offset < info.duration:
+            r.check_cancel()
+            length = min(chunk, info.duration - offset)
+            audio = _decode_pcm(info.path, offset, length, r.cancel_event, track_no, info.track_count)
+            if audio.size >= SAMPLE_RATE // 2:
+                part = server.analyze(audio, EMOTION_WINDOW, EMOTION_HOP).shifted(offset)
+                windows += part.windows
+                model, labels = part.model, part.labels
+            offset += chunk
+            progress(min(1.0, offset / info.duration))
+        track = EmotionTrack(model, labels, windows)
+        self.log(f"Emotions: {len(windows)} windows ({model or 'no audio'}).")
+        try:  # always refresh the cache, "use_cache" only controls reading it
+            save_emotions(path, track)
+        except OSError:
+            pass
+        return track
 
     def _jump_cut_ranges(self, moment: Moment, env: AudioEnvelope, is_short: bool) -> list:
         threshold = self.settings.silence_threshold if self.settings.silence_threshold < 0 else None
@@ -618,7 +688,8 @@ class Pipeline:
             for m in highlight:
                 m.keep = self._jump_cut_ranges(m, env, is_short=False)
             for m in shorts:
-                m.keep = self._jump_cut_ranges(m, env, is_short=True)
+                if m.edit is None:
+                    m.keep = self._jump_cut_ranges(m, env, is_short=True)
 
         encoder = pick_encoder(s.encoder)
         self.log(f"Encoder: {encoder} ({s.quality} quality)")
@@ -836,7 +907,7 @@ class Pipeline:
                 raise ValueError("Nothing to render: the project has no short.")
             m = project.shorts[0]
             env = self._envelope or self._cached_envelope(info)
-            if env is not None:
+            if env is not None and m.edit is None:
                 m.keep = self._jump_cut_ranges(m, env, is_short=True)
             ranges = m.pieces(s.shorts_jump_cuts)
             facecam = s.facecam_rect() if s.facecam.strip() else None
@@ -880,16 +951,16 @@ class Pipeline:
         adaptive = project.settings.shorts_layout == "auto"
 
         def play_ranges(m: Moment) -> list:
-            ranges = m.ranges(s.shorts_jump_cuts)
-            return list(m.hook) + ranges if s.shorts_hook and m.hook else ranges
+            pieces = m.pieces(s.shorts_jump_cuts)
+            return list(m.hook) + pieces if s.shorts_hook and m.hook else pieces
 
-        total = sum(total_duration(play_ranges(m)) for m in moments) or 1.0
+        total = sum(pieces_duration(play_ranges(m)) for m in moments) or 1.0
         progress = r.stage("shorts", "Rendering vertical shorts")
         done = 0.0
         for i, m in enumerate(moments, 1):
             r.check_cancel()
             ranges = play_ranges(m)
-            length = total_duration(ranges)
+            length = pieces_duration(ranges)
             title = self._moment_title(m, f"Short {i}")
             name = slugify(title, 40) or format_tag(m.start)
             path = shorts_dir / f"short_{i:02d}_{name}.mp4"
