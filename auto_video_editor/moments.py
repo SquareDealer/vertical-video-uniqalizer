@@ -100,6 +100,7 @@ class ScoreCurve:
     keywords: np.ndarray
     keyword_hits: Dict[int, str]
     has_speech: bool
+    emotion: Optional[np.ndarray] = None   # per-second emotion signal (0..1) when an emotion server was used
 
 
 def _smooth(values: np.ndarray, window: int) -> np.ndarray:
@@ -132,12 +133,16 @@ def normalize_text(text: str) -> str:
 
 def build_curve(env: AudioEnvelope, transcript: Optional[Transcript], duration: float,
                 keywords: Sequence[str] = (), weights: Optional[Dict[str, float]] = None,
-                skip: Tuple[float, float] = (0.0, 0.0)) -> ScoreCurve:
-    """Per-second score. ``weights`` multiplies each signal: loudness, spikes, speech, keywords, exclamations.
-    ``skip`` = seconds ignored at the start and at the end of the recording."""
-    gain = {"loudness": 1.0, "spikes": 1.0, "speech": 1.0, "keywords": 1.0, "exclamations": 1.0}
+                skip: Tuple[float, float] = (0.0, 0.0), emotion: Optional[np.ndarray] = None) -> ScoreCurve:
+    """Per-second score. ``weights`` multiplies each signal: loudness, spikes, speech, keywords, exclamations,
+    emotion. ``skip`` = seconds ignored at the start and at the end of the recording. ``emotion`` is an
+    optional per-second array (0..1, e.g. ``EmotionTrack.score``); without it the weights are the old ones."""
+    gain = {"loudness": 1.0, "spikes": 1.0, "speech": 1.0, "keywords": 1.0, "exclamations": 1.0, "emotion": 1.0}
     gain.update(weights or {})
     n = max(1, int(math.ceil(duration)))
+    if emotion is not None:
+        emotion = np.asarray(emotion, dtype=np.float32)[:n]
+        emotion = np.pad(emotion, (0, n - emotion.size))
     loud, loudest_frame = env.per_second(n)
     silence = env.silence_threshold()
 
@@ -198,11 +203,19 @@ def build_curve(env: AudioEnvelope, transcript: Optional[Transcript], duration: 
                 a, b = max(0, int(seg.start)), min(n, int(seg.end) + 1)
                 exclaim[a:b] = np.maximum(exclaim[a:b], min(1.0, 0.5 * marks))
 
-        raw = (0.35 * gain["loudness"] * excitement + 0.20 * gain["spikes"] * burst
-               + 0.15 * gain["speech"] * speech + 0.20 * gain["keywords"] * keyword_score
-               + 0.10 * gain["exclamations"] * exclaim)
-    else:
+        if emotion is None:
+            raw = (0.35 * gain["loudness"] * excitement + 0.20 * gain["spikes"] * burst
+                   + 0.15 * gain["speech"] * speech + 0.20 * gain["keywords"] * keyword_score
+                   + 0.10 * gain["exclamations"] * exclaim)
+        else:
+            raw = (0.30 * gain["emotion"] * emotion + 0.25 * gain["loudness"] * excitement
+                   + 0.15 * gain["spikes"] * burst + 0.05 * gain["speech"] * speech
+                   + 0.20 * gain["keywords"] * keyword_score + 0.05 * gain["exclamations"] * exclaim)
+    elif emotion is None:
         raw = 0.60 * gain["loudness"] * excitement + 0.40 * gain["spikes"] * burst
+    else:
+        raw = (0.30 * gain["emotion"] * emotion + 0.42 * gain["loudness"] * excitement
+               + 0.28 * gain["spikes"] * burst)
 
     raw = (raw * (0.4 + 0.6 * active)).astype(np.float32)
     skip_start, skip_end = skip
@@ -210,7 +223,7 @@ def build_curve(env: AudioEnvelope, transcript: Optional[Transcript], duration: 
         raw[:min(n, int(skip_start))] = 0.0
     if skip_end > 0:
         raw[max(0, n - int(skip_end)):] = 0.0
-    return ScoreCurve(_smooth(raw, 5), raw, excitement, burst, speech, keyword_score, hits, bool(words))
+    return ScoreCurve(_smooth(raw, 5), raw, excitement, burst, speech, keyword_score, hits, bool(words), emotion)
 
 
 # -- boundary snapping ------------------------------------------------------------------------

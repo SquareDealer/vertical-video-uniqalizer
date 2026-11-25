@@ -1,3 +1,4 @@
+import numpy as np
 import pytest
 
 from auto_video_editor.moments import (Moment, build_curve, compute_keep_ranges, find_candidates, pad_moments,
@@ -93,3 +94,32 @@ def test_moment_keep_has_speeds_and_old_projects_still_load():
     assert old.pieces(True) == [(0.0, 4.0, 1.0), (5.0, 9.0, 1.0)] and old.hook == [(6.0, 8.0)]
     planned = Moment(0, 9, edit={"peak": 5.5})
     assert Moment.from_dict(planned.to_dict()).edit == {"peak": 5.5}
+
+
+def _active(env, n):
+    return (env.per_second(n)[0] > env.silence_threshold()).astype(np.float32)
+
+
+def test_emotion_reweights_the_curve_and_no_emotion_keeps_the_old_weights(envelope_factory, transcript_factory):
+    env = envelope_factory(duration=60)       # no loud burst: loudness + spikes (0.40) would outweigh emotion (0.30)
+    transcript = transcript_factory([(10, 14, "just walking around here"), (30, 34, "oh my god no way")])
+    old = build_curve(env, transcript, 60, keywords=["oh my god"])
+    factor = 0.4 + 0.6 * _active(env, 60)
+    assert old.emotion is None
+    assert old.raw == pytest.approx((0.35 * old.excitement + 0.20 * old.burst + 0.15 * old.speech
+                                     + 0.20 * old.keywords) * factor, abs=1e-6)
+    emotion = np.zeros(60, np.float32)
+    emotion[40:44] = 1.0
+    new = build_curve(env, transcript, 60, keywords=["oh my god"], emotion=emotion)
+    assert new.raw == pytest.approx((0.30 * emotion + 0.25 * new.excitement + 0.15 * new.burst + 0.05 * new.speech
+                                     + 0.20 * new.keywords) * factor, abs=1e-6)
+    assert int(np.argmax(new.score)) in range(40, 44), "a laughing voice beats a reaction phrase"
+    assert int(np.argmax(old.score)) not in range(40, 44)
+
+
+def test_emotion_without_words_and_with_a_short_array(envelope_factory):
+    env = envelope_factory(duration=30)
+    curve = build_curve(env, None, 30, emotion=np.ones(10, np.float32))
+    factor = 0.4 + 0.6 * _active(env, 30)
+    padded = np.concatenate([np.ones(10), np.zeros(20)])
+    assert curve.raw == pytest.approx((0.30 * padded + 0.42 * curve.excitement + 0.28 * curve.burst) * factor, abs=1e-6)
