@@ -143,3 +143,32 @@ def test_watch_limits_cpu_during_render(store, tmp_path, monkeypatch):
         render(tmp_path / "a.mp4", tmp_path, 3, threading.Event(), ClipOptions())
     assert seen == [{"threads": 3, "low_priority": True}]
     assert ffmpeg._LIMITS == {"threads": 0, "low_priority": False}, "limits end with the clip"
+
+
+def test_trigger_offset_from_the_autoclipper():
+    assert clip_options({"trigger-offset-ms": "37000"}).trigger_offset == 37.0
+    assert clip_options({}).trigger_offset is None
+    for bad in ("soon", "-5", "12.5"):
+        options = clip_options({"trigger-offset-ms": bad})
+        assert options.trigger_offset is None and len(options.notes) == 1
+    s = watch_settings(Settings(watch_emotion_url="http://emo:8092", emotion_url="http://manual"), clip_options({"trigger-offset-ms": "37000"}))
+    assert (s.emotion_url, s.trigger_offset) == ("http://emo:8092", 37.0)
+    assert watch_settings(Settings(), ClipOptions()).trigger_offset == -1.0
+    assert watch_settings(Settings(), clip_options({"montage-mode": "full"})).emotion_url == "", "full: no emotions needed"
+
+
+class Planned(FakeRender):
+    """A render whose versions carry the edit plan of the clip."""
+
+    def __call__(self, *args, **kwargs):
+        variants = super().__call__(*args, **kwargs)
+        for variant in variants:
+            variant.edit = {"peak": 31.5, "lead_in": 11.3}
+        return variants
+
+
+def test_edit_plan_reaches_the_manifest(store, tmp_path):
+    put_source(store)
+    k = output_keys(SOURCE, "uniqalized", 3)
+    make_watcher(store, tmp_path, Planned())[0].run_once(threading.Event())
+    assert store.get_json(k.manifest)["edit"] == {"peak": 31.5, "lead_in": 11.3}

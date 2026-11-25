@@ -32,6 +32,7 @@ except Exception:  # pragma: no cover - depends on the platform build
     DND_FILES = TkinterDnD = None
 
 from . import __app_name__, __version__, icons, vision
+from .emotion import EmotionServer
 from .ffmpeg import _CREATION_FLAGS, MediaInfo, ffmpeg_bin, missing_tools, probe
 from .glossary import (Pack, all_categories, auto_packs, get_pack, load_packs, pack_errors, resolve_packs,
                        write_pack_template)
@@ -2341,6 +2342,11 @@ class App:
         except RuntimeError as exc:
             self.events.put(("watch_status", None, False))
             log(f"Speech server not ready, clips will wait: {exc}")
+        if settings.watch_emotion_url.strip():
+            try:
+                log(f"Emotion server: {EmotionServer(settings.watch_emotion_url).check()}")
+            except RuntimeError as exc:
+                log(f"Emotion server not ready, clips will wait: {exc}")
         root = cache_dir() / "s3watch"
         try:
             with s3watch.acquire_lock(root / "watch.lock"):
@@ -2349,7 +2355,8 @@ class App:
                 watcher = s3watch.Watcher(store, settings, s3watch.default_render_fn(settings, log), root / "work",
                                           s3watch.WatchState(root / "state.json"), log,
                                           speech_check=s3watch.speech_check_for(settings),
-                                          webhook=s3watch.webhook_for(root, log))
+                                          webhook=s3watch.webhook_for(root, log),
+                                          emotion_check=s3watch.emotion_check_for(settings))
                 watcher.run_forever(stop)
         except Exception as exc:  # noqa: BLE001
             log(f"Watcher stopped: {exc}")

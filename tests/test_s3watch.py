@@ -11,6 +11,7 @@ import pytest
 boto3 = pytest.importorskip("boto3")
 moto = pytest.importorskip("moto")
 
+from auto_video_editor.emotion import EmotionServerUnavailable  # noqa: E402
 from auto_video_editor.s3store import S3Config, S3Store, file_md5  # noqa: E402
 from auto_video_editor.s3watch import (RenderedVariant, Watcher, WatchState, acquire_lock, is_ready,  # noqa: E402
                                        is_source_key, output_keys)
@@ -60,10 +61,10 @@ class FakeRender:
         return result
 
 
-def make_watcher(store, tmp_path, render, speech_check=None, **settings):
+def make_watcher(store, tmp_path, render, speech_check=None, emotion_check=None, **settings):
     logs = []
     watcher = Watcher(store, Settings(**settings), render, tmp_path / "work", WatchState(tmp_path / "state.json"),
-                      logs.append, speech_check=speech_check)
+                      logs.append, speech_check=speech_check, emotion_check=emotion_check)
     return watcher, logs
 
 
@@ -430,3 +431,29 @@ def test_watcher_publishes_a_broadcast_clip_and_the_old_layout(store, tmp_path):
     fresh, _ = make_watcher(store, tmp_path / "again", FakeRender())
     summary = fresh.run_once(threading.Event())
     assert (summary.done, summary.skipped) == (0, 2), "versions are never taken for new clips"
+
+
+def test_emotion_server_down_keeps_clip_pending(store, tmp_path):
+    put_source(store)
+    k = output_keys(SOURCE, "uniqalized", 3)
+    watcher, logs = make_watcher(store, tmp_path, FakeRender(error=EmotionServerUnavailable("connection refused")),
+                                 emotion_check=lambda: False)
+    summary = watcher.run_once(threading.Event())
+    assert (summary.pending, summary.failed) == (1, 0)
+    status = store.get_json(k.status)
+    assert status["state"] == "waiting" and status["status"] == "processing"
+    assert status["reason"].startswith("emotion server unavailable")
+    assert watcher.state.failures(store.head(SOURCE)) == 0
+
+
+def test_emotion_error_on_a_healthy_server_counts_against_the_clip(store, tmp_path):
+    put_source(store)
+    watcher, _ = make_watcher(store, tmp_path, FakeRender(error=EmotionServerUnavailable("503")), emotion_check=lambda: True)
+    assert watcher.run_once(threading.Event()).failed == 1
+
+
+def test_manifest_edit_is_null_without_a_plan(store, tmp_path):   # FakeRender as is
+    put_source(store)
+    k = output_keys(SOURCE, "uniqalized", 3)
+    make_watcher(store, tmp_path, FakeRender())[0].run_once(threading.Event())
+    assert store.get_json(k.manifest)["edit"] is None

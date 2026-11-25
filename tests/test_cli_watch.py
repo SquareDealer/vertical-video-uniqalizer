@@ -52,6 +52,7 @@ def test_watch_once_against_moto(isolated, monkeypatch, capsys):
         assert store.get_json(output_keys(SOURCE, "uniqalized", 3).manifest)["clip_id"] == "c1"
     out = capsys.readouterr()
     assert "topsecret" not in out.out + out.err and "AKIATEST" not in out.out + out.err
+    assert "emotion server http://localhost:8092" in out.out
 
 
 def test_watch_requires_credentials(isolated, capsys):

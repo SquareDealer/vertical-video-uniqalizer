@@ -34,6 +34,7 @@ from typing import Callable, Dict, Iterator, List, Optional
 from urllib.parse import quote
 
 from . import __version__
+from .emotion import EmotionServerUnavailable
 from .reporting import Cancelled
 from .s3store import ObjectInfo, S3Store, file_md5
 from .settings import Settings
@@ -51,6 +52,7 @@ class RenderedVariant:
     captions: bool
     duration: float = 0.0          # seconds, after cuts and speed
     source_duration: float = 0.0
+    edit: Optional[dict] = None    # the edit plan of the clip (Moment.edit), written into the manifest
 
 
 @dataclass
@@ -60,6 +62,7 @@ class ClipOptions:
     stream_area: str = ""    # stream-region: the game picture; "" = the whole frame
     mode: str = "cut"        # cut: pauses removed; full: the whole length as it is
     stream_id: str = ""
+    trigger_offset: Optional[float] = None   # seconds from the clip start where the chat fired; None = unknown
     notes: List[str] = field(default_factory=list)  # metadata values that were ignored, and why
 
 
@@ -77,7 +80,7 @@ def _region(value: str) -> Optional[str]:
 
 
 def clip_options(metadata: Optional[Dict[str, str]]) -> ClipOptions:
-    """Read ``webcam-region``, ``stream-region``, ``montage-mode`` and ``stream-id`` of a source."""
+    """Read ``webcam-region``, ``stream-region``, ``montage-mode``, ``trigger-offset-ms`` and ``stream-id``."""
     meta = {k.lower(): (v or "").strip() for k, v in (metadata or {}).items()}
     options = ClipOptions(stream_id=meta.get("stream-id", ""))
     for name, attr in (("webcam-region", "facecam"), ("stream-region", "stream_area")):
@@ -87,6 +90,12 @@ def clip_options(metadata: Optional[Dict[str, str]]) -> ClipOptions:
                 options.notes.append(f"{name}={meta[name]!r} is not x,y,w,h between 0 and 1, ignored")
             else:
                 setattr(options, attr, value)
+    trigger = meta.get("trigger-offset-ms", "")
+    if trigger:
+        if re.fullmatch(r"[0-9]+", trigger, re.ASCII):
+            options.trigger_offset = int(trigger) / 1000.0
+        else:
+            options.notes.append(f"trigger-offset-ms={trigger!r} is not a whole number of milliseconds, ignored")
     mode = meta.get("montage-mode", "")
     if mode in MONTAGE_MODES:
         options.mode = mode
@@ -105,6 +114,9 @@ def watch_settings(settings: Settings, options: ClipOptions) -> Settings:
     s.whole_clip_full = options.mode == "full"
     s.shorts_jump_cuts = not s.whole_clip_full
     s.facecam, s.stream_area = options.facecam, options.stream_area
+    # A full clip gets no edit plan, so it must not wait for the emotion server either.
+    s.emotion_url = "" if s.whole_clip_full else settings.watch_emotion_url
+    s.trigger_offset = options.trigger_offset if options.trigger_offset is not None else -1.0
     return s
 
 
@@ -338,6 +350,7 @@ def process_clip(store: S3Store, source: ObjectInfo, settings: Settings, render:
             "captions": all(v.captions for v in variants),
             "variants": entries, "app_version": __version__, "created": _now(),
             "stt": {"url": settings.stt_url, "model": settings.stt_model},
+            "edit": variants[0].edit,
             "montage_mode": options.mode, "stream_id": options.stream_id or None,
             "regions": {"webcam": options.facecam or None, "stream": options.stream_area or None,
                         "source": "swiper" if options.facecam or options.stream_area else "auto"},
@@ -396,10 +409,12 @@ class WatchState:
 class Watcher:
     def __init__(self, store: S3Store, settings: Settings, render: RenderFn, work_dir: Path, state: WatchState,
                  log: Callable[[str], None], speech_check: Optional[Callable[[], bool]] = None,
-                 webhook: Optional[WebhookOutbox] = None) -> None:
+                 webhook: Optional[WebhookOutbox] = None,
+                 emotion_check: Optional[Callable[[], bool]] = None) -> None:
         self.store, self.settings, self.render = store, settings, render
         self.webhook = webhook  # CRM notification after a publish; None = the CRM reads the bucket
         self.speech_check = speech_check
+        self.emotion_check = emotion_check
         self.work_dir, self.state, self.log = Path(work_dir), state, log
         self._ready: set = set()  # (key, etag) known to be published, saves S3 requests every cycle
         self._parked_logged: set = set()
@@ -457,6 +472,12 @@ class Watcher:
                     write_status(self.store, keys, "waiting", source, attempt,
                                  reason=f"speech server unavailable: {exc}")
                     break
+                if isinstance(exc, EmotionServerUnavailable) and not self._emotion_server_answers():
+                    summary.pending += 1
+                    self.log(f"Emotion server unavailable, {source.key} stays in the queue: {exc}")
+                    write_status(self.store, keys, "waiting", source, attempt,
+                                 reason=f"emotion server unavailable: {exc}")
+                    break
                 if is_transient(exc):
                     summary.pending += 1
                     self.log(f"Network or storage error, {source.key} will be retried: {reason}")
@@ -500,6 +521,15 @@ class Watcher:
             return False
         try:
             return bool(self.speech_check())
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _emotion_server_answers(self) -> bool:
+        """After an emotion error: is the server itself fine (so this clip is the problem)?"""
+        if self.emotion_check is None:
+            return False
+        try:
+            return bool(self.emotion_check())
         except Exception:  # noqa: BLE001
             return False
 
@@ -590,6 +620,18 @@ def speech_check_for(settings: Settings) -> Callable[[], bool]:
     return check
 
 
+def emotion_check_for(settings: Settings) -> Callable[[], bool]:
+    """Probe used by the watcher to tell a down emotion server from a clip the server cannot handle."""
+    from .emotion import EmotionServer
+
+    def check() -> bool:
+        if settings.watch_emotion_url.strip():
+            EmotionServer(settings.watch_emotion_url, timeout=10).check()
+        return True
+
+    return check
+
+
 def default_render_fn(settings: Settings, log: Callable[[str], None]) -> RenderFn:
     """Analyze the clip once (Kamerton captions, cuts without pauses) and render the versions."""
     from .ffmpeg import probe, resource_limits
@@ -610,12 +652,15 @@ def default_render_fn(settings: Settings, log: Callable[[str], None]) -> RenderF
                 log("  montage mode full: the whole clip, pauses kept")
             pipeline = Pipeline(str(source), s, str(work / "out"), Reporter(log, None, cancel))
             project = pipeline.analyze()
+            edit = project.shorts[0].edit if project.shorts else None
+            if edit and edit.get("trigger_offset") is not None:
+                log(f"  chat trigger from the Autoclipper at {edit['trigger_offset']:.1f} s")
             has_facecam = bool(project.effective_settings(s).facecam.strip())
             result = []
             for spec in variant_presets(count, has_facecam):
                 path, captions = pipeline.render_variant(project, spec, work / f"v{spec.index}.mp4")
                 result.append(RenderedVariant(path, spec.to_dict(), captions, probe(str(path)).duration,
-                                              project.media.duration))
+                                              project.media.duration, edit))
             return result
 
     return render

@@ -267,13 +267,15 @@ def _watch(args: argparse.Namespace) -> int:
     log(f"Auto mode: {config!r}")
     log(f"Watching s3://{config.bucket}/{settings.watch_prefix}<streamer>/ every {settings.watch_interval} s, "
         f"{settings.watch_variants} versions into <streamer>/{settings.watch_subdir}/, "
-        f"speech server {settings.stt_url}.")
+        f"speech server {settings.stt_url}, "
+        f"{'emotion server ' + settings.watch_emotion_url if settings.watch_emotion_url.strip() else 'no emotion server'}.")
     try:
         with s3watch.acquire_lock(root / "watch.lock"):
             watcher = s3watch.Watcher(open_store(config), settings, s3watch.default_render_fn(settings, log),
                                       root / "work", s3watch.WatchState(root / "state.json"), log,
                                       speech_check=s3watch.speech_check_for(settings),
-                                      webhook=s3watch.webhook_for(root, log, env_file))
+                                      webhook=s3watch.webhook_for(root, log, env_file),
+                                      emotion_check=s3watch.emotion_check_for(settings))
             stop = threading.Event()
             if args.once:
                 summary = watcher.run_once(stop)
