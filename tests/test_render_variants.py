@@ -56,13 +56,18 @@ def test_speed_and_zoom_reach_the_graph():
     assert args[args.index("-t", len(args) - 12) + 1] == f"{6.0 / 1.03:.3f}"
 
 
-@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not installed")
-def test_speed_changes_duration(tmp_path):
+def _lavfi_source(tmp_path):
+    """A 6 s test clip (video + 440 Hz tone) and its media info."""
     src = tmp_path / "src.mp4"
     subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc2=size=640x360:rate=30:duration=6",
                     "-f", "lavfi", "-i", "sine=frequency=440:duration=6", "-c:v", "libx264", "-preset",
                     "ultrafast", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest", str(src)], check=True)
-    info = probe(str(src))
+    return probe(str(src))
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not installed")
+def test_speed_changes_duration(tmp_path):
+    info = _lavfi_source(tmp_path)
     out = tmp_path / "out.mp4"
     Renderer(info, "libx264", "draft").render_segment([(0.0, 6.0)], out, layout="blur", speed=1.03,
                                                       game_zoom=1.03, game_shift=-0.6)
@@ -88,3 +93,27 @@ def test_stream_area_in_the_blur_layout():
     args = build("blur", game_area=(0.0, 0.0, 1.0, 0.62))
     graph = args[args.index("-filter_complex") + 1]
     assert "[fgsrc]crop=1920:670:0:0," in graph
+
+
+def test_piece_speed_reaches_the_graph():
+    renderer = Renderer(INFO, "libx264", "standard")
+    args = renderer.build_segment_command([(1.0, 5.0), (7.0, 13.0, 2.0)], "out.mp4")
+    graph = args[args.index("-filter_complex") + 1]
+    assert "trim=start=1.000:end=5.000,setpts=PTS-STARTPTS[v0]" in graph, "normal pieces as before"
+    assert "setpts=(PTS-STARTPTS)/2[v1]" in graph
+    assert "asetpts=PTS-STARTPTS,atempo=2,afade=t=in" in graph
+    assert f"afade=t=out:st={3.0 - 0.02:.3f}" in graph, "the fade is placed in sped-up time"
+    assert args[args.index("-t", len(args) - 12) + 1] == "7.000"
+    single = renderer.build_segment_command([(1.0, 5.0, 2.0)], "out.mp4")
+    graph = single[single.index("-filter_complex") + 1]
+    assert "setpts=(PTS-STARTPTS)/2[vcat]" in graph and "asetpts=PTS-STARTPTS,atempo=2[acat]" in graph
+    with pytest.raises(ValueError):
+        renderer.build_segment_command([(1.0, 5.0, 8.0)], "out.mp4")
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not installed")
+def test_sped_up_piece_shortens_the_file(tmp_path):
+    info = _lavfi_source(tmp_path)
+    out = tmp_path / "out.mp4"
+    Renderer(info, "libx264", "draft").render_segment([(0.0, 2.0), (2.0, 6.0, 2.0)], out, layout="blur")
+    assert probe(str(out)).duration == pytest.approx(4.0, abs=0.15)

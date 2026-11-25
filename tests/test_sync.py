@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 
 from auto_video_editor.ffmpeg import probe
+from auto_video_editor.captions import remap_words_sequence
 from auto_video_editor.render import Renderer
 
 pytestmark = pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not installed")
@@ -63,3 +64,11 @@ def test_clips_stay_in_sync(tmp_path, kind):
         renderer.render_segment(ranges, out)
         errors = _sync_errors(out)
         assert max(errors) < 0.06, f"{kind} {ranges}: audio/video offsets {[round(e, 3) for e in errors]}"
+
+
+def test_captions_follow_sped_up_pieces():
+    words = [[1.0, 1.4, "раз"], [9.0, 9.4, "два"]]
+    timed = remap_words_sequence(words, [(0.0, 2.0), (2.0, 8.0, 2.0), (8.0, 10.0)])
+    assert [(round(w.start, 2), round(w.end, 2)) for w in timed] == [(1.0, 1.4), (6.0, 6.4)]
+    inside = remap_words_sequence([[4.0, 5.0, "быстро"]], [(0.0, 2.0), (2.0, 8.0, 2.0)])
+    assert (inside[0].start, inside[0].end) == (pytest.approx(3.0), pytest.approx(3.5))

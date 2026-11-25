@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Iterable, List, Optional, Sequence
 
-from .timeline import TimeMap, format_ass_time, format_srt_time
+from .timeline import TimeMap, as_piece, format_ass_time, format_srt_time
 
 
 SPEAKER_COLORS = ["#FFFFFF", "#7DD3FC", "#F9A8D4", "#86EFAC", "#FDBA74", "#C4B5FD"]
@@ -46,12 +46,13 @@ def remap_words_sequence(words: Iterable, ranges: Sequence) -> List[TimedWord]:
     time (a teaser hook played before the short)."""
     result: List[TimedWord] = []
     offset = 0.0
-    for a, b in ranges:
+    for item in ranges:
+        a, b, speed = as_piece(item)
         for word in remap_words(words, TimeMap([(a, b)])):
-            word.start += offset
-            word.end += offset
+            word.start = word.start / speed + offset
+            word.end = word.end / speed + offset
             result.append(word)
-        offset += b - a
+        offset += (b - a) / speed
     return result
 
 

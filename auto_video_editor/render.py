@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Callable, List, Optional, Sequence, Tuple
 
 from .ffmpeg import MediaInfo, audio_codec_args, audio_input, run_ffmpeg, video_codec_args
-from .timeline import Range, total_duration
+from .timeline import Piece, as_piece, pieces_duration
 
 VERTICAL_W, VERTICAL_H = 1080, 1920
 SPLIT_TOP_H = 640
@@ -198,7 +198,7 @@ class Renderer:
 
     def build_segment_command(
         self,
-        ranges: Sequence[Range],
+        ranges: Sequence[Sequence[float]],
         output: str,
         *,
         layout: Optional[str] = None,
@@ -217,21 +217,26 @@ class Renderer:
     ) -> List[str]:
         """ffmpeg arguments that cut ``ranges`` out of the source into one file.
 
-        ``speed`` plays the result faster or slower without changing the pitch; ``video_effects`` is an
+        A range is ``(start, end)`` or ``(start, end, speed)``: a piece with its own speed (0.5..4.0) is
+        sped up or slowed down before the pieces are joined. ``speed`` plays the result faster or slower without changing the pitch; ``video_effects`` is an
         ffmpeg filter chain applied before the captions; ``extra_output_args`` go just before the output.
         """
         info = self.info
-        ranges = [(a, b) for a, b in ranges if b - a > 0.04]
-        if not ranges:
+        pieces = [as_piece(r) for r in ranges]
+        pieces = [p for p in pieces if p[1] - p[0] > 0.04]
+        if not pieces:
             raise ValueError("Nothing to render: empty time range")
         if not 0.5 <= speed <= 2.0:
             raise ValueError(f"speed {speed} is outside 0.5..2.0")
-        out_duration = total_duration(ranges)
+        for _, _, piece_speed in pieces:
+            if not 0.5 <= piece_speed <= 4.0:
+                raise ValueError(f"piece speed {piece_speed} is outside 0.5..4.0")
+        out_duration = pieces_duration(pieces)
 
         # Chronological ranges share one input. A range that goes back in time (a teaser hook) opens a
         # new input, so ffmpeg never has to keep minutes of decoded frames in memory.
-        runs: List[List[Range]] = []
-        for rg in ranges:
+        runs: List[List[Piece]] = []
+        for rg in pieces:
             if runs and rg[0] >= runs[-1][-1][1] - 1e-3:
                 runs[-1].append(rg)
             else:
@@ -240,13 +245,13 @@ class Renderer:
         graph: List[str] = []
         vsrc: List[str] = []
         asrc: List[str] = []
-        local: List[Range] = []
+        local: List[Piece] = []
         for index, run in enumerate(runs):
             # Seek a little before the cut: fast seeking can land after the target (MPEG-TS) and the
             # frame shown at the cut point may have been decoded before it (variable frame rate).
             origin, finish = max(0.0, run[0][0] - SEEK_PREROLL), run[-1][1]
             args += ["-ss", f"{origin:.3f}", "-t", f"{finish - origin + 0.1:.3f}", "-i", info.path]
-            local += [(a - origin, b - origin) for a, b in run]
+            local += [(a - origin, b - origin, sp) for a, b, sp in run]
             # Put both streams on one clock starting at the seek point before cutting: constant frame
             # rate video and gap-free audio. Variable frame rate recordings (OBS, phones) and audio
             # that starts later than the video (Twitch VODs, MKV/TS) drift out of sync otherwise.
@@ -271,17 +276,21 @@ class Renderer:
 
         count = len(local)
         if count == 1:
-            a, b = local[0]
-            graph.append(f"{vsrc[0]}trim=start={a:.3f}:end={b:.3f},setpts=PTS-STARTPTS[vcat]")
+            a, b, sp = local[0]
+            vpts = "PTS-STARTPTS" if sp == 1.0 else f"(PTS-STARTPTS)/{sp:g}"
+            graph.append(f"{vsrc[0]}trim=start={a:.3f}:end={b:.3f},setpts={vpts}[vcat]")
             if info.has_audio:
-                graph.append(f"{asrc[0]}atrim=start={a:.3f}:end={b:.3f},asetpts=PTS-STARTPTS[acat]")
+                tempo = "" if sp == 1.0 else f",atempo={sp:g}"
+                graph.append(f"{asrc[0]}atrim=start={a:.3f}:end={b:.3f},asetpts=PTS-STARTPTS{tempo}[acat]")
         else:
-            for i, (a, b) in enumerate(local):
-                graph.append(f"{vsrc[i]}trim=start={a:.3f}:end={b:.3f},setpts=PTS-STARTPTS[v{i}]")
+            for i, (a, b, sp) in enumerate(local):
+                vpts = "PTS-STARTPTS" if sp == 1.0 else f"(PTS-STARTPTS)/{sp:g}"
+                graph.append(f"{vsrc[i]}trim=start={a:.3f}:end={b:.3f},setpts={vpts}[v{i}]")
                 if info.has_audio:
+                    tempo = "" if sp == 1.0 else f",atempo={sp:g}"
                     graph.append(
-                        f"{asrc[i]}atrim=start={a:.3f}:end={b:.3f},asetpts=PTS-STARTPTS,"
-                        f"afade=t=in:d={MICRO_FADE},afade=t=out:st={max(0.0, b - a - MICRO_FADE):.3f}:d={MICRO_FADE}[a{i}]"
+                        f"{asrc[i]}atrim=start={a:.3f}:end={b:.3f},asetpts=PTS-STARTPTS{tempo},"
+                        f"afade=t=in:d={MICRO_FADE},afade=t=out:st={max(0.0, (b - a) / sp - MICRO_FADE):.3f}:d={MICRO_FADE}[a{i}]"
                     )
             if info.has_audio:
                 pairs = "".join(f"[v{i}][a{i}]" for i in range(count))
@@ -337,14 +346,14 @@ class Renderer:
         ]
         return args
 
-    def render_segment(self, ranges: Sequence[Range], output: Path,
+    def render_segment(self, ranges: Sequence[Sequence[float]], output: Path,
                        on_progress: Optional[Callable[[float], None]] = None,
                        cwd: Optional[str] = None, **options) -> None:
         output = Path(output)
         tmp = output.with_name(f".{output.stem}.partial{output.suffix}")
         args = self.build_segment_command(ranges, str(tmp.resolve()), **options)
         try:
-            run_ffmpeg(args, duration=total_duration(ranges), on_progress=on_progress,
+            run_ffmpeg(args, duration=pieces_duration(ranges), on_progress=on_progress,
                        cancel_event=self.cancel_event, cwd=cwd)
             os.replace(tmp, output)
         finally:
@@ -352,10 +361,10 @@ class Renderer:
                 tmp.unlink()
 
     # -- loudness ----------------------------------------------------------------------------------
-    def measure_segment_loudness(self, ranges: Sequence[Range], target_lufs: float) -> Optional[dict]:
+    def measure_segment_loudness(self, ranges: Sequence[Sequence[float]], target_lufs: float) -> Optional[dict]:
         if not self.info.has_audio or not ranges:
             return None
-        origin, finish = min(a for a, _ in ranges), max(b for _, b in ranges)
+        origin, finish = min(r[0] for r in ranges), max(r[1] for r in ranges)
         source = audio_input(0, self.audio_track, self.info.track_count)
         args = ["-ss", f"{origin:.3f}", "-t", f"{finish - origin:.3f}", "-i", self.info.path,
                 "-filter_complex", f"{source}{loudnorm_measure_filter(target_lufs)}[m]", "-map", "[m]",
