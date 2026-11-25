@@ -99,6 +99,9 @@ def watch_settings(settings: Settings, options: ClipOptions) -> Settings:
     """Settings of one clip in auto mode: Kamerton captions, the regions and the mode of the Swiper."""
     s = Settings.from_dict(settings.to_dict())
     s.whole_clip, s.transcriber, s.captions = True, "http", True
+    # The layout of the app (maybe "split" with a webcam drawn for manual edits) never applies here: without
+    # regions from the Swiper the webcam is detected, and without a webcam the versions use blur/smart crop.
+    s.shorts_layout = "auto"
     s.whole_clip_full = options.mode == "full"
     s.shorts_jump_cuts = not s.whole_clip_full
     s.facecam, s.stream_area = options.facecam, options.stream_area
@@ -589,29 +592,30 @@ def speech_check_for(settings: Settings) -> Callable[[], bool]:
 
 def default_render_fn(settings: Settings, log: Callable[[str], None]) -> RenderFn:
     """Analyze the clip once (Kamerton captions, cuts without pauses) and render the versions."""
-    from .ffmpeg import probe
+    from .ffmpeg import probe, resource_limits
     from .pipeline import Pipeline
     from .reporting import Reporter
     from .variants import variant_presets
 
     def render(source: Path, work: Path, count: int, cancel: threading.Event,
                options: Optional[ClipOptions] = None) -> List[RenderedVariant]:
-        options = options or ClipOptions()
-        s = watch_settings(settings, options)
-        if options.facecam:
-            log(f"  webcam from the Swiper: {options.facecam}")
-        if options.stream_area:
-            log(f"  stream area from the Swiper: {options.stream_area}")
-        if options.mode == "full":
-            log("  montage mode full: the whole clip, pauses kept")
-        pipeline = Pipeline(str(source), s, str(work / "out"), Reporter(log, None, cancel))
-        project = pipeline.analyze()
-        has_facecam = bool(project.effective_settings(s).facecam.strip())
-        result = []
-        for spec in variant_presets(count, has_facecam):
-            path, captions = pipeline.render_variant(project, spec, work / f"v{spec.index}.mp4")
-            result.append(RenderedVariant(path, spec.to_dict(), captions, probe(str(path)).duration,
-                                          project.media.duration))
-        return result
+        with resource_limits(settings.watch_threads, True):
+            options = options or ClipOptions()
+            s = watch_settings(settings, options)
+            if options.facecam:
+                log(f"  webcam from the Swiper: {options.facecam}")
+            if options.stream_area:
+                log(f"  stream area from the Swiper: {options.stream_area}")
+            if options.mode == "full":
+                log("  montage mode full: the whole clip, pauses kept")
+            pipeline = Pipeline(str(source), s, str(work / "out"), Reporter(log, None, cancel))
+            project = pipeline.analyze()
+            has_facecam = bool(project.effective_settings(s).facecam.strip())
+            result = []
+            for spec in variant_presets(count, has_facecam):
+                path, captions = pipeline.render_variant(project, spec, work / f"v{spec.index}.mp4")
+                result.append(RenderedVariant(path, spec.to_dict(), captions, probe(str(path)).duration,
+                                              project.media.duration))
+            return result
 
     return render

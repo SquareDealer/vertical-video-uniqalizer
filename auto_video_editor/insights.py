@@ -21,7 +21,7 @@ from typing import Callable, List, Optional, Sequence, Tuple
 import numpy as np
 
 from . import vision
-from .ffmpeg import _CREATION_FLAGS, MediaInfo, ffmpeg_bin
+from .ffmpeg import MediaInfo, ffmpeg_bin, limit_command, spawn_options
 from .glossary import detect_game
 from .reporting import Cancelled
 
@@ -101,7 +101,7 @@ def grab_frames(path: str, t: float, width: int, height: int, count: int = 1, ra
     cmd += ["-ss", f"{max(0.0, t):.3f}", "-i", path, "-map", "0:v:0", "-an", "-vf", video_filter,
             "-frames:v", str(count), "-f", "rawvideo", "-"]
     try:
-        proc = subprocess.run(cmd, capture_output=True, timeout=90, creationflags=_CREATION_FLAGS)
+        proc = subprocess.run(limit_command(cmd), capture_output=True, timeout=90, **spawn_options())
     except (OSError, subprocess.TimeoutExpired):
         return []
     channels = 3 if color else 1
