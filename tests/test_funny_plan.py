@@ -130,3 +130,15 @@ def test_plan_dict_has_the_manifest_fields():
     assert data["emotion"] == {"model": "gigaam-emo", "peak_positive": 0.82}
     assert plan(score_with(60, **{"30": 1.0})).to_dict()["emotion"] is None
     json.dumps(data)
+
+
+def test_start_never_lands_inside_a_laugh():
+    talk = [(0, 8, "so we are walking here and nothing happens at all"),
+            (22, 27.5, "wait wait what is that thing over there guys"),
+            (28, 31.5, "it is a chicken with a gun")]
+    positive = np.zeros(60, np.float32)
+    positive[9:21] = 0.9                      # a wordless laugh of the previous joke
+    p = plan(score_with(60, **{"30": 1.0}), make_transcript(talk), positive=positive)
+    assert p.anchor == 28.0
+    assert p.start == pytest.approx(9.0), "the lead-in point fell into the laugh: the video starts at its beginning"
+    assert 10.0 <= p.lead_in <= 20.0

@@ -196,10 +196,12 @@ def clip_pieces(pieces: Sequence[Piece], a: float, b: float) -> List[Piece]:
 
 
 def choose_start(pieces: Sequence[Piece], anchor: float, segments: Sequence, words: Sequence,
-                 lead_in_min: float, lead_in_max: float) -> Tuple[float, bool]:
+                 lead_in_min: float, lead_in_max: float, protected: Sequence[Range] = ()) -> Tuple[float, bool]:
     """Where the video starts: ``lead_in_min`` seconds of finished video before the joke, on a phrase.
 
     Returns ``(start, lead_in_short)``; ``lead_in_short`` when the file has less lead-in than that.
+    A start inside a protected range (a laugh, a positive voice) moves to the beginning of that range, or
+    past its end when the lead-in would then exceed ``lead_in_max``: the video never opens mid-laugh.
     """
     first = pieces[0][0]
     if output_between(pieces, first, anchor) < lead_in_min:
@@ -221,6 +223,13 @@ def choose_start(pieces: Sequence[Piece], anchor: float, segments: Sequence, wor
         word = next((w for w in words if _span(w)[0] < t < _span(w)[1]), None)
         if word is not None:
             t = _span(word)[0]
+    for ps, pe in protected:
+        if ps < t < pe:
+            if output_between(pieces, ps, anchor) <= lead_in_max:
+                t = ps
+            elif pe < anchor:
+                t = pe
+            break
     return max(first, t), False
 
 
@@ -292,7 +301,7 @@ def plan_edit(*, duration: float, score: np.ndarray, env: AudioEnvelope, transcr
         all_pieces = uncut
 
     def trim(source: List[Piece]) -> Tuple[float, float, bool]:
-        start, short = choose_start(source, anchor, segments, words, lead_in_min, lead_in_max)
+        start, short = choose_start(source, anchor, segments, words, lead_in_min, lead_in_max, protected)
         end = end0
         if end - start > long_after:
             end = _snap_end(min(end0, max(start + long_cut, peak + 3.0)), words)

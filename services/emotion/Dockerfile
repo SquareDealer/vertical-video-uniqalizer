@@ -11,9 +11,9 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# GigaAM is not on PyPI under a pinned name for us: take it from GitHub (a build arg picks the branch or tag).
+# GigaAM comes from GitHub; the build arg is a branch, a tag or a commit (pin it once the image has been verified).
 ARG GIGAAM_REF=main
-RUN pip install --no-cache-dir "gigaam @ https://github.com/salute-developers/GigaAM/archive/refs/heads/${GIGAAM_REF}.tar.gz"
+RUN pip install --no-cache-dir "gigaam @ https://github.com/salute-developers/GigaAM/archive/${GIGAAM_REF}.tar.gz"
 
 ENV OMP_NUM_THREADS=2
 COPY ave_emotion ave_emotion
