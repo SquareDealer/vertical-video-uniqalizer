@@ -35,7 +35,9 @@
 - Emotion cache key = `media_fingerprint(path)` + server URL hash + audio track + window/hop (the same scheme as the transcript cache; the server URL stands for the model).
 - Per-second emotion = overlap-weighted mean of the windows touching that second; no extra smoothing (`build_curve` already smooths the score).
 - Wordless passages are judged per **gap** (a maximal run without words, laughter or `positive`): dead air inside it is cut by the old rule; what is left ("live" seconds) decides: `< min_silence` untouched, `≤ quiet_cut_max` the whole gap is cut, longer → the rest of the gap plays at `quiet_speed`.
-- The wordless rule needs a transcript with at least one word in the clip. No transcript, or a recognizer that heard nothing, means we cannot tell speech from silence: only the old dead-air rule applies then (protects the anti-goal "speech is sped up" when Kamerton misses a language).
+- **Deviation from spec §6, needs the user's OK:** the wordless rule needs a transcript with at least one word in the clip. No transcript, or a recognizer that heard nothing, means we cannot tell speech from silence: only the old dead-air rule applies then (protects the anti-goal "speech is sped up" when Kamerton misses a language). By the letter of the spec such a clip would be sped up whole. The log line of Task 9 and the README say when it happened.
+- The end of the video is the last word + 0.5 s as before, but never earlier than 3 s after the peak (or the end of the laughter / `positive` range there): a wordless reaction is not cut off.
+- A `full` clip is not sent to the emotion server.
 - The lead-in edit applies to every non-`full` whole clip, with or without emotions. `VariantSpec.hook` is removed; `edit` gets an extra `end` field.
 - `event-start-offset-ms` is not read by AVE.
 
@@ -304,7 +306,7 @@ def _active(env, n):
     return (env.per_second(n)[0] > env.silence_threshold()).astype(np.float32)
 
 def test_emotion_reweights_the_curve_and_no_emotion_keeps_the_old_weights(envelope_factory, transcript_factory):
-    env = envelope_factory(duration=60, loud=[(20, 24)])
+    env = envelope_factory(duration=60)       # no loud burst: loudness + spikes (0.40) would outweigh emotion (0.30)
     transcript = transcript_factory([(10, 14, "just walking around here"), (30, 34, "oh my god no way")])
     old = build_curve(env, transcript, 60, keywords=["oh my god"])
     factor = 0.4 + 0.6 * _active(env, 60)
@@ -316,7 +318,7 @@ def test_emotion_reweights_the_curve_and_no_emotion_keeps_the_old_weights(envelo
     new = build_curve(env, transcript, 60, keywords=["oh my god"], emotion=emotion)
     assert new.raw == pytest.approx((0.30 * emotion + 0.25 * new.excitement + 0.15 * new.burst + 0.05 * new.speech
                                      + 0.20 * new.keywords) * factor, abs=1e-6)
-    assert int(np.argmax(new.score)) in range(40, 44), "a laughing voice beats loud gameplay"
+    assert int(np.argmax(new.score)) in range(40, 44), "a laughing voice beats a reaction phrase"
     assert int(np.argmax(old.score)) not in range(40, 44)
 
 def test_emotion_without_words_and_with_a_short_array(envelope_factory):
@@ -442,8 +444,8 @@ def test_protected_ranges_from_laughter_and_positive():
 
 `plan_edit` algorithm:
 1. A trigger outside `0…duration` is dropped (`trigger_offset` becomes None). `window = search_window(…)`, `peak = find_peak(…)`, `anchor = find_anchor(peak, segments)`.
-2. `words` = all words of the transcript; `end0 = min(duration, last word end + 0.5)` with words, else `duration`.
-3. `speech_rule = bool(words)`; `protected = protected_ranges(words, positive)`; `all_pieces = plan_pieces(0.0, end0, …, protected=protected, speech_rule=speech_rule, …)` when `jump_cuts`, else `[(0.0, end0, 1.0)]`.
+2. `words` = all words of the transcript; `protected = protected_ranges(words, positive)`. The reaction must stay even when it has no recognized words (GigaAM rarely writes laughter as text): `tail = peak + 3.0`, moved to the end of a protected range that covers it; `end0 = min(duration, max(last word end + 0.5, tail))` with words, else `duration`.
+3. `speech_rule = bool(words)`; `all_pieces = plan_pieces(0.0, end0, …, protected=protected, speech_rule=speech_rule, …)` when `jump_cuts`, else `[(0.0, end0, 1.0)]`.
 4. `start, short = choose_start(all_pieces, anchor, segments, words, lead_in_min, lead_in_max)`.
 5. `end = end0`; if `end − start > long_after`: `end = min(end0, max(start + long_cut, peak + 3.0))`, and if that lands inside a word, `end = word.start`.
 6. `pieces = clip_pieces(all_pieces, start, end)`. The 5-second rule: if `pieces_duration(pieces) < min(MIN_OUTPUT, end0)` the cuts are dropped — repeat steps 4–5 with `all_pieces = [(0.0, end0, 1.0)]` and return `pieces = []` (the clip plays `start…end` uncut).
@@ -492,8 +494,16 @@ def test_lead_in_counts_finished_video_not_source_seconds():
             (24, 27.5, "it is a chicken with a gun")]
     env = make_envelope(duration=60, base=-20, quiet=[(6.3, 15.7)])      # 9.4 s of dead air inside the lead-in
     p = plan_edit(duration=60.0, score=score_with(60, **{"25": 1.0}), env=env, transcript=make_transcript(talk))
-    assert p.anchor == 24.0 and p.start < 6.0, "14 source seconds before the joke are not 10 s of video"
-    assert p.lead_in >= 10.0 or p.lead_in_short
+    assert p.anchor == 24.0 and p.start == 0.0, "14 source seconds before the joke are not 10 s of video"
+    assert p.lead_in == pytest.approx(13.35, abs=0.2) and not p.lead_in_short   # 6.45 + 6.65 + 0.25 s of pieces
+
+def test_wordless_laugh_after_the_last_word_stays_in_the_video():
+    positive = np.zeros(60, np.float32)
+    positive[32:36] = 0.9
+    p = plan(score_with(60, **{"33": 1.0}), make_transcript(TALK[:4]), positive=positive)
+    assert p.anchor == 28.0 and p.end == pytest.approx(36.5, abs=0.06), "the reaction is not cut off after the last word"
+    assert p.start <= p.peak <= p.end
+    assert not any(s != 1.0 and a < 36 and b > 32 for a, b, s in p.pieces)
 
 def test_long_phrase_start_lands_on_a_word():
     talk = [(0, 27.5, " ".join(f"w{i}" for i in range(55))), (28, 31.5, "it is a chicken with a gun")]
@@ -564,7 +574,7 @@ If an exact number above disagrees with the algorithm as specified by a frame (0
 - Consumes: `EmotionServer`, `EmotionTrack`, `load_cached`/`save_cached` (Task 5); `build_curve(emotion=…)` (Task 6); `plan_edit`, `EditPlan` (Task 8); `Moment.pieces/edit` (Task 1); settings (Task 4); `_decode_pcm` (transcribe).
 - Produces:
   - `Pipeline._load_emotions(info: MediaInfo, s: Settings) -> EmotionTrack` — cache file `cache_dir()/emotions/{media_fingerprint}-{sha1(server.url)[:8]}{-t<track> unless 1}-w{window:g}-h{hop:g}-v1.json`, read when `s.use_cache`, always written. On a miss: log `Emotion server: {describe} — {check()}.`, decode the listened audio track in chunks of 600 s (`_decode_pcm`), `analyze` each, shift the windows by the chunk offset, join. Log `Emotions: {n} windows ({model}).` Exceptions of the client pass through.
-  - `_analyze`: emotions are loaded when `s.emotion_url.strip()` and the file has audio (stage `("emotion", 6)` in `r.plan`, 0 when off); `build_curve(..., emotion=track.score(n))`. In whole-clip mode candidates are no longer searched (`candidates = []` when `s.whole_clip`). Whole clip, not `whole_clip_full`: `plan = plan_edit(duration=info.duration, score=curve.score, env=env, transcript=transcript, positive=track.per_second("positive", n) or None, emotion_model=track.model, trigger=s.trigger_offset if ≥ 0 else None, jump_cuts=s.shorts_jump_cuts, min_silence=s.min_silence, threshold=<as _jump_cut_ranges>, lead_in_min=…, lead_in_max=…, quiet_cut_max=…, quiet_speed=…, long_after=s.whole_clip_max, long_cut=s.whole_clip_cut)`; the short is `Moment(plan.start, plan.end, 100.0, plan.peak, reasons=["whole clip"], keep=plan.pieces, edit=plan.to_dict())`. Log one line: `Funny moment: peak {peak:.1f} s, joke from {anchor:.1f} s, video from {start:.1f} s (lead-in {lead_in:.1f} s[, short]), {cuts} cuts, {k} sped-up passages.` `whole_clip_full` keeps using `_whole_clip_moment(..., full=True)` and gets no `edit`.
+  - `_analyze`: emotions are loaded when `s.emotion_url.strip()` and the file has audio (stage `("emotion", 6)` in `r.plan`, 0 when off); `build_curve(..., emotion=track.score(n) if track is not None else None)` (`track` is None when emotions are off). In whole-clip mode candidates are no longer searched (`candidates = []` when `s.whole_clip`). Whole clip, not `whole_clip_full`: `plan = plan_edit(duration=info.duration, score=curve.score, env=env, transcript=transcript, positive=track.per_second("positive", n) if track is not None else None, emotion_model=track.model if track is not None else "", trigger=s.trigger_offset if ≥ 0 else None, jump_cuts=s.shorts_jump_cuts, min_silence=s.min_silence, threshold=<as _jump_cut_ranges>, lead_in_min=…, lead_in_max=…, quiet_cut_max=…, quiet_speed=…, long_after=s.whole_clip_max, long_cut=s.whole_clip_cut)`; the short is `Moment(plan.start, plan.end, 100.0, plan.peak, reasons=["whole clip"], keep=plan.pieces, edit=plan.to_dict())`. Log one line: `Funny moment: peak {peak:.1f} s, joke from {anchor:.1f} s, video from {start:.1f} s (lead-in {lead_in:.1f} s[, short]), {cuts} cuts, {k} sped-up passages.` — with `, no words recognized: wordless passages left as they are` appended when the transcript has no words. When `s.trigger_offset >= 0` and `plan.trigger_offset is None`, also log `Chat trigger at {t:.1f} s is outside the clip ({duration:.1f} s): ignored, the whole clip is searched.` `whole_clip_full` keeps using `_whole_clip_moment(..., full=True)` and gets no `edit`.
   - A moment with `edit` is never re-cut: `_attach_details`, `_render` and `render_variant` skip `_jump_cut_ranges` when `moment.edit is not None`; its `hook` is `[]`.
   - `_render_shorts` and `render_variant` pass `m.pieces(s.shorts_jump_cuts)` to `_render_one_short` (durations via `pieces_duration`).
 
@@ -628,18 +638,19 @@ Move `_video` and `_pipeline` of `tests/test_whole_clip.py` to `tests/_clips.py`
 ### Task 10: Watcher — trigger metadata, waiting for the emotion server, `edit` in the manifest
 
 **Files:**
-- Modify: `auto_video_editor/s3watch.py`, `auto_video_editor/cli.py` (`_watch`)
-- Test: `tests/test_swiper_contract.py`, `tests/test_s3watch.py`
+- Modify: `auto_video_editor/s3watch.py`, `auto_video_editor/cli.py` (`_watch`), `auto_video_editor/gui.py` (the watch thread that builds `s3watch.Watcher`, near line 2349)
+- Test: `tests/test_swiper_contract.py`, `tests/test_s3watch.py`, `tests/test_cli_watch.py`
 
 **Interfaces:**
 - Consumes: `EmotionServer`, `EmotionServerUnavailable` (Task 5), settings (Task 4), `Moment.edit` (Task 9).
 - Produces:
   - `ClipOptions.trigger_offset: Optional[float] = None` (seconds). `clip_options` reads `trigger-offset-ms`: digits only → `int / 1000`; anything else → note `trigger-offset-ms='…' is not a whole number of milliseconds, ignored`.
-  - `watch_settings`: `s.emotion_url = settings.watch_emotion_url`; `s.trigger_offset = options.trigger_offset` or `-1.0`.
-  - `RenderedVariant.edit: Optional[dict] = None`; `default_render_fn` fills it from `project.shorts[0].edit` and logs `  chat trigger from the Autoclipper at {t:.1f} s` when known; the manifest gets `"edit": variants[0].edit`.
+  - `watch_settings`: `s.emotion_url = "" if s.whole_clip_full else settings.watch_emotion_url` (a `full` clip gets no edit plan, so it must not wait for the emotion server); `s.trigger_offset = options.trigger_offset` or `-1.0`.
+  - `RenderedVariant.edit: Optional[dict] = None`; `default_render_fn` fills it from `project.shorts[0].edit` and logs `  chat trigger from the Autoclipper at {t:.1f} s` only when that `edit` has a non-null `trigger_offset`; the manifest gets `"edit": variants[0].edit`.
   - `Watcher.__init__(..., emotion_check: Optional[Callable[[], bool]] = None)`; in `run_once`, before the transient check: `EmotionServerUnavailable` while `emotion_check` fails (or is None) → `summary.pending += 1`, log `Emotion server unavailable, {key} stays in the queue: {exc}`, `write_status(…, "waiting", …, reason=f"emotion server unavailable: {exc}")`, `break`. When the check passes, the exception is a clip failure like any other.
   - `emotion_check_for(settings: Settings) -> Callable[[], bool]` — `EmotionServer(settings.watch_emotion_url, timeout=10).check()`; always True when the address is empty.
   - `cli._watch` passes `emotion_check=s3watch.emotion_check_for(settings)` and names the emotion server in its start-up log line (`emotion server {url}` or `no emotion server`).
+  - The GUI watcher passes the same `emotion_check` (without it an emotion error on a healthy server would keep a clip waiting forever and block the queue) and logs `Emotion server: {check()}` or `Emotion server not ready, clips will wait: {exc}` next to its speech server line; nothing when `watch_emotion_url` is empty.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -654,6 +665,7 @@ def test_trigger_offset_from_the_autoclipper():
     s = watch_settings(Settings(watch_emotion_url="http://emo:8092", emotion_url="http://manual"), clip_options({"trigger-offset-ms": "37000"}))
     assert (s.emotion_url, s.trigger_offset) == ("http://emo:8092", 37.0)
     assert watch_settings(Settings(), ClipOptions()).trigger_offset == -1.0
+    assert watch_settings(Settings(), clip_options({"montage-mode": "full"})).emotion_url == "", "full: no emotions needed"
 
 def test_edit_plan_reaches_the_manifest(store, tmp_path):
     # a FakeRender subclass whose variants carry edit={"peak": 31.5, "lead_in": 11.3}
@@ -743,9 +755,9 @@ Use `fastapi.testclient.TestClient` as a context manager so start-up runs.
 **Files:**
 - Modify: `README.md`, `docs/crm-integration.md`, `.github/workflows/tests.yml`
 
-- [ ] **Step 1: README (Russian).** "Как это устроено": the edit is now "подводка → шутка → реакция" (one short paragraph: emotions, lead-in ≥ 10 s, wordless passages cut/sped up). "Чем отличаются версии": remove the hook of v2. "Установка": a step "Сервис эмоций" next to Kamerton — `cd services\emotion`, `docker compose up -d --build` (first build downloads ~1 GB of weights), check `http://localhost:8092/health`. "Настройки": the six rows of the spec table (§3). "Что появляется в бакете" / manifest description: the `edit` field with the example of the spec and one line per key. "Частые проблемы": `state: waiting`, `reason: emotion server unavailable` → start the container. "Разработка": `emotion.py`, `funny.py`, `services/emotion/` in the code map and how to run the service tests.
-- [ ] **Step 2: `docs/crm-integration.md` (Russian).** Metadata table: `trigger-offset-ms` (read; whole milliseconds from the start of the clip file; absent or invalid → the funny moment is searched in the whole clip), `event-start-offset-ms` (ignored). Fix the `montage-mode full` row (no hook). States: waiting also for the emotion server. Manifest example: add `edit` (and `"edit": null` for `full`); explain each key in a small table.
-- [ ] **Step 3: CI.** Add `"moto[s3]>=5" boto3` is **not** needed; add a second job `emotion-service` (ubuntu, Python 3.11): `pip install -r services/emotion/requirements-dev.txt`, `python -m pytest services/emotion/tests -q` with `working-directory: services/emotion`.
+- [ ] **Step 1: README (Russian).** "Как это устроено": the edit is now "подводка → шутка → реакция" (one short paragraph: emotions, lead-in ≥ 10 s, wordless passages cut/sped up; one sentence: если в клипе не распознано ни одного слова, куски без речи не трогаются, вырезается только тишина). "Чем отличаются версии": remove the hook of v2. "Установка": a step "Сервис эмоций" next to Kamerton — `cd services\emotion`, `docker compose up -d --build` (first build downloads ~1 GB of weights), check `http://localhost:8092/health`. "Настройки": the six rows of the spec table (§3). "Что появляется в бакете" / manifest description: the `edit` field with the example of the spec and one line per key. "Частые проблемы": `state: waiting`, `reason: emotion server unavailable` → start the container. "Разработка": `emotion.py`, `funny.py`, `services/emotion/` in the code map and how to run the service tests.
+- [ ] **Step 2: `docs/crm-integration.md` (Russian).** Metadata table: `trigger-offset-ms` (read; whole milliseconds from the start of the clip file; absent or invalid → the funny moment is searched in the whole clip), `event-start-offset-ms` (ignored). Fix the `montage-mode full` row (no hook) and rewrite the `cut` row: начало обрезается до подводки ≥ 10 с перед смешным моментом; паузы вырезаются, короткие куски без речи вырезаются, длинные ускоряются; если после обрезки начала клип длиннее 3 минут — остаётся до 90 с исходника от начала подводки. States: waiting also for the emotion server. Manifest example: add `edit` (and `"edit": null` for `full`); explain each key in a small table.
+- [ ] **Step 3: CI.** Add a second job `emotion-service` (ubuntu, Python 3.11) with `defaults.run.working-directory: services/emotion` and the steps `python -m pip install -r requirements-dev.txt`, `python -m pytest tests -q`.
 - [ ] **Step 4:** Run the whole suite: `pytest -q` → only `test_edl_and_xml` may fail. Commit `docs: funny moment edit, emotion service and the edit field of the manifest`.
 
 ---
