@@ -143,6 +143,7 @@ class Settings:
     watch_variants: int = 3
     watch_interval: int = 60
     watch_max_failures: int = 3
+    watch_threads: int = 4      # ffmpeg threads per process in auto mode, at a lower priority (0 = no limit)
     language: str = ""  # empty = auto-detect
     beam_size: int = 5
     vocabulary: List[str] = field(default_factory=list)  # names/jargon the transcriber should know
@@ -299,6 +300,7 @@ class Settings:
         check_range("watch_variants", 1, 10)
         check_range("watch_interval", 10, 3600)
         check_range("watch_max_failures", 1, 100)
+        check_range("watch_threads", 0, 64)
         check_range("audio_bitrate", 64, 320)
         if not re.fullmatch(r"#?[0-9a-fA-F]{6}", self.caption_color.strip()):
             errors.append("caption_color must be a hex color such as #FFE600")

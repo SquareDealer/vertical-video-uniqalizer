@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import contextlib
 import os
 import shutil
 import subprocess
@@ -17,6 +18,44 @@ from .reporting import Cancelled
 
 # Hide console windows spawned from the GUI on Windows.
 _CREATION_FLAGS = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+_BELOW_NORMAL = 0x4000  # BELOW_NORMAL_PRIORITY_CLASS
+_LIMITS = {"threads": 0, "low_priority": False}  # set by resource_limits() for the auto mode
+
+
+@contextlib.contextmanager
+def resource_limits(threads: int, low_priority: bool):
+    """Limit the ffmpeg processes started meanwhile: ``threads`` per decoder, filter and encoder (0 = no
+    limit), and a lower process priority, so a render does not take the whole computer."""
+    previous = dict(_LIMITS)
+    _LIMITS.update(threads=max(0, int(threads)), low_priority=bool(low_priority))
+    try:
+        yield
+    finally:
+        _LIMITS.clear()
+        _LIMITS.update(previous)
+
+
+def limit_command(cmd: Sequence[str]) -> List[str]:
+    """``cmd`` with the thread limit applied, when it runs ffmpeg."""
+    cmd = list(cmd)
+    n = _LIMITS["threads"]
+    if not n or not cmd or not os.path.basename(cmd[0]).lower().startswith("ffmpeg"):
+        return cmd
+    out = [cmd[0], "-filter_threads", str(n), "-filter_complex_threads", str(n)]
+    for arg in cmd[1:-1]:
+        if arg == "-i":
+            out += ["-threads", str(n)]
+        out.append(arg)
+    return out + ["-threads", str(n), cmd[-1]]
+
+
+def spawn_options() -> dict:
+    """``subprocess`` keyword arguments: no console window, and the lower priority when limited."""
+    if os.name == "nt":
+        return {"creationflags": _CREATION_FLAGS | (_BELOW_NORMAL if _LIMITS["low_priority"] else 0)}
+    if _LIMITS["low_priority"]:
+        return {"preexec_fn": lambda: os.nice(10)}
+    return {}
 
 
 class FFmpegError(RuntimeError):
@@ -97,7 +136,7 @@ def probe(path: str) -> MediaInfo:
     ]
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
-                              errors="replace", creationflags=_CREATION_FLAGS)
+                              errors="replace", **spawn_options())
     except FileNotFoundError:
         require_tools()
         raise
@@ -201,8 +240,8 @@ def run_ffmpeg(
            "-progress", "pipe:1", "-nostats", *args]
     try:
         proc = subprocess.Popen(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=cwd,
-            text=True, encoding="utf-8", errors="replace", creationflags=_CREATION_FLAGS,
+            limit_command(cmd), stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=cwd,
+            text=True, encoding="utf-8", errors="replace", **spawn_options(),
         )
     except FileNotFoundError:
         require_tools()
@@ -263,8 +302,8 @@ def pcm_reader_command(path: str, sample_rate: int, start: Optional[float] = Non
 
 
 def popen_binary(cmd: Sequence[str]) -> subprocess.Popen:
-    return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                            creationflags=_CREATION_FLAGS)
+    return subprocess.Popen(limit_command(cmd), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            **spawn_options())
 
 
 # -- encoders --------------------------------------------------------------------------------

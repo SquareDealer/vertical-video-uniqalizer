@@ -115,3 +115,31 @@ def test_old_layout_without_regions(store, tmp_path):
     assert render.options[0] == ClipOptions(), "no regions: the layout is detected as before"
     manifest = store.get_json(output_keys(SOURCE, "uniqalized", 3, prefix="montage/").manifest)
     assert manifest["regions"]["source"] == "auto" and manifest["montage_mode"] == "cut"
+
+
+def test_no_regions_with_split_saved_in_the_app_falls_back_to_detection():
+    """The app may have shorts_layout=split saved for manual edits: a clip without regions must not fail."""
+    user = Settings(shorts_layout="split", facecam="0.003,0.008,0.247,0.236")
+    s = watch_settings(user, ClipOptions())
+    assert s.shorts_layout == "auto" and s.facecam == ""
+    assert s.validate() == [], "the webcam is detected, or the versions fall back to blur/smart"
+    with_regions = watch_settings(user, clip_options(SWIPER_META))
+    assert with_regions.shorts_layout == "auto" and with_regions.facecam == "0.7000,0.6500,0.2750,0.3056"
+
+
+def test_watch_limits_cpu_during_render(store, tmp_path, monkeypatch):
+    from auto_video_editor import ffmpeg, s3watch
+
+    seen = []
+
+    class FakePipeline:
+        def __init__(self, *a, **k):
+            seen.append(dict(ffmpeg._LIMITS))
+            raise RuntimeError("stop here")
+
+    monkeypatch.setattr("auto_video_editor.pipeline.Pipeline", FakePipeline)
+    render = s3watch.default_render_fn(Settings(watch_threads=3), lambda _m: None)
+    with pytest.raises(RuntimeError):
+        render(tmp_path / "a.mp4", tmp_path, 3, threading.Event(), ClipOptions())
+    assert seen == [{"threads": 3, "low_priority": True}]
+    assert ffmpeg._LIMITS == {"threads": 0, "low_priority": False}, "limits end with the clip"
