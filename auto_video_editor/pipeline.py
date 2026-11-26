@@ -14,7 +14,7 @@ from pathlib import Path
 import numpy as np
 from typing import List, Optional, Tuple
 
-from . import __version__, publish, vision
+from . import __version__, overlays, publish, vision
 from .audio import AudioEnvelope, analyze_audio, media_fingerprint
 from .captions import build_ass, build_srt, remap_words, remap_words_sequence
 from .censor import censor_text, profanity_set
@@ -26,7 +26,7 @@ from .insights import (VideoInsights, auto_layout, auto_model, auto_shorts_count
                        scan_video, speech_stats)
 from .moments import (Moment, build_curve, compute_hook, compute_keep_ranges, find_candidates, plan_shorts,
                       select_highlight)
-from .render import SPLIT_TOP_H, Renderer, caption_margin, caption_top_margin, loudnorm_apply_filter
+from .render import SPLIT_TOP_H, Renderer, caption_margin, caption_top_margin, loudnorm_apply_filter, seam_y
 from .variants import VariantSpec, speed_words
 from .reporting import Reporter
 from .settings import CONTENT_LABELS, Settings, cache_dir
@@ -797,7 +797,8 @@ class Pipeline:
                             uppercase=s.caption_uppercase, highlight=s.caption_color,
                             max_words=s.caption_words, position=s.caption_position,
                             speaker_colors=s.caption_speaker_colors, text_color=s.caption_text_color,
-                            top_margin=caption_top_margin(short_layout, render_options.get("split_top", SPLIT_TOP_H)))
+                            top_margin=caption_top_margin(short_layout, render_options.get("split_top", SPLIT_TOP_H),
+                                                          render_options.get("overlay")))
             (work / captions_file).write_text(ass, encoding="utf-8")
 
         audio_filter = None
@@ -846,16 +847,25 @@ class Pipeline:
             renderer = Renderer(info, pick_encoder(s.encoder), spec.quality, self.reporter.cancel_event,
                                 audio_bitrate=s.audio_bitrate, blur=s.blur_strength,
                                 audio_track=self._track(info, "output_audio_track"))
+            overlay = None
+            if spec.overlay:
+                seam = seam_y(layout, info, spec.split_top, s.stream_area_rect())
+                overlay = overlays.place(spec.overlay, seam, s.watch_overlay_dir.strip() or None)
+            overlay_note = ""
+            if overlay is not None:
+                still = "" if overlay.animated else " (still picture: this ffmpeg has no libvpx-vp9)"
+                overlay_note = f", {overlay.kind} overlay{still}"
             stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
             extra = ["-g", str(spec.gop), "-map_metadata", "-1", "-metadata", f"comment={uuid.uuid4().hex}",
                      "-metadata", f"creation_time={stamp}"]
             self.log(f"Version {spec.index}: {layout} layout, {spec.caption_style} captions {spec.caption_position}"
-                     f"{', hook' if s.shorts_hook and m.hook else ''}, speed {spec.speed:g}, zoom {spec.zoom:g}.")
+                     f"{', hook' if s.shorts_hook and m.hook else ''}, speed {spec.speed:g}, zoom {spec.zoom:g}"
+                     f"{overlay_note}.")
             _layout, _x, words = self._render_one_short(
                 project, m, output, renderer, work, ranges, f"v{spec.index}.ass", layout, facecam, adaptive=False,
                 speed=spec.speed, game_zoom=spec.zoom, game_shift=spec.shift, split_top=spec.split_top,
                 game_area=s.stream_area_rect(),
-                video_effects=spec.effects, extra_output_args=extra)
+                video_effects=spec.effects, overlay=overlay, extra_output_args=extra)
             return output, bool(words) and s.captions
         finally:
             shutil.rmtree(work, ignore_errors=True)
