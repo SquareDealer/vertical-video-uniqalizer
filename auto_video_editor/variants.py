@@ -1,7 +1,7 @@
 """Versions of one clip for posting from several TikTok accounts.
 
-Every version plays the same cuts and words; they differ in the webcam band, caption style and color (visible) and
-in zoom, color, grain, speed, GOP and container metadata (subtle). No mirroring: it flips on-screen
+Every version plays the same cuts and words; they differ in the webcam band, caption style and color and the
+branding overlay (visible) and in zoom, color, grain, speed, GOP and container metadata (subtle). No mirroring: it flips on-screen
 text. With a webcam overlay no version crops the frame, so the webcam is never lost.
 """
 
@@ -29,6 +29,7 @@ class VariantSpec:
     effects: str              # ffmpeg filter chain applied before the captions
     gop: int                  # keyframe interval
     quality: str              # encoder quality preset
+    overlay: str = ""         # neon | ticker | banner (overlays.py); "" = none
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -47,7 +48,11 @@ _LOOKS = (
 )
 
 
-def variant_presets(count: int, has_facecam: bool) -> List[VariantSpec]:
+# One overlay per look: a neon divider, a ticker divider, a banner (data/overlays).
+OVERLAYS = ("neon", "ticker", "banner")
+
+
+def variant_presets(count: int, has_facecam: bool, overlays: bool = True) -> List[VariantSpec]:
     specs = []
     for i in range(max(0, count)):
         look, cycle = _LOOKS[i % 3], i // 3
@@ -67,6 +72,7 @@ def variant_presets(count: int, has_facecam: bool) -> List[VariantSpec]:
             index=i + 1, layout=layout, split_top=split_top, caption_style=look["caption_style"],
             caption_color=look["caption_color"], caption_text_color=look["caption_text_color"], caption_position=look["caption_position"], hook=look["hook"],
             zoom=zoom, shift=shift, speed=look["speed"], effects=effects, gop=48 + 12 * i, quality=look["quality"],
+            overlay=OVERLAYS[i % 3] if overlays else "",
         ))
     return specs
 

@@ -612,7 +612,7 @@ def default_render_fn(settings: Settings, log: Callable[[str], None]) -> RenderF
             project = pipeline.analyze()
             has_facecam = bool(project.effective_settings(s).facecam.strip())
             result = []
-            for spec in variant_presets(count, has_facecam):
+            for spec in variant_presets(count, has_facecam, s.watch_overlays):
                 path, captions = pipeline.render_variant(project, spec, work / f"v{spec.index}.mp4")
                 result.append(RenderedVariant(path, spec.to_dict(), captions, probe(str(path)).duration,
                                               project.media.duration))
