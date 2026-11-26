@@ -1,0 +1,39 @@
+{
+  "tag": "@neuryobank",
+  "canvas": {"width": 1080, "height": 1920},
+  "assets": {
+    "neon": {
+      "png": "neon.png",
+      "webm": "neon.webm",
+      "width": 1080,
+      "height": 140,
+      "fps": 30,
+      "durationSec": 5,
+      "loop": true,
+      "anchor": "seam",
+      "y": "split_top - 70"
+    },
+    "ticker": {
+      "png": "ticker.png",
+      "webm": "ticker.webm",
+      "width": 1080,
+      "height": 100,
+      "fps": 30,
+      "durationSec": 5,
+      "loop": true,
+      "anchor": "seam",
+      "y": "split_top - 50"
+    },
+    "banner": {
+      "png": "banner.png",
+      "webm": "banner.webm",
+      "width": 1080,
+      "height": 240,
+      "fps": 30,
+      "durationSec": 5,
+      "loop": false,
+      "anchor": "fixed",
+      "y": 1130
+    }
+  }
+}

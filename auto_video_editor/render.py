@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Callable, List, Optional, Sequence, Tuple
 
 from .ffmpeg import MediaInfo, audio_codec_args, audio_input, run_ffmpeg, video_codec_args
+from .overlays import Overlay
 from .timeline import Piece, as_piece, pieces_duration
 
 VERTICAL_W, VERTICAL_H = 1080, 1920
@@ -136,10 +137,31 @@ def vertical_filter(src: str, dst: str, info: MediaInfo, layout: str,
     return f"{src}crop={cw}:{ch}:{x}:{y},scale={W}:{H}:flags=lanczos,setsar=1{dst}"
 
 
-def caption_top_margin(layout: str, split_top: int = SPLIT_TOP_H) -> Optional[int]:
+def seam_y(layout: str, info: MediaInfo, split_top: int = SPLIT_TOP_H,
+           game_area: Optional[Tuple[float, float, float, float]] = None) -> Optional[int]:
+    """Height of the edge between two pictures of a vertical layout: the webcam band and the game
+    (split), the blurred band and the picture (blur). None for a full-frame crop or a picture that
+    fills the frame."""
+    if layout == "split":
+        return max(2, min(VERTICAL_H - 2, _even(split_top)))
+    if layout != "blur":
+        return None
+    _crop, w, h = _area_crop(info.width or 1920, info.height or 1080, game_area)
+    if w * VERTICAL_H <= h * VERTICAL_W:  # as tall as the frame or taller: no band above the picture
+        return None
+    return (VERTICAL_H - _even(VERTICAL_W * h / w)) // 2
+
+
+def caption_top_margin(layout: str, split_top: int = SPLIT_TOP_H,
+                       overlay: Optional[Overlay] = None) -> Optional[int]:
     """Top margin for captions placed at the top: below the webcam band of the split layout, so they
-    never cover the streamer's face. None = the usual top margin."""
-    return split_top + 40 if layout == "split" else None
+    never cover the streamer's face, and below a divider drawn on its seam. None = the usual top margin."""
+    if layout != "split":
+        return None
+    margin = split_top + 40
+    if overlay is not None and overlay.y <= split_top <= overlay.bottom:
+        margin = max(margin, overlay.bottom)
+    return margin
 
 
 def caption_margin(layout: str, info: MediaInfo) -> int:
@@ -213,13 +235,16 @@ class Renderer:
         split_top: int = SPLIT_TOP_H,
         game_area: Optional[Tuple[float, float, float, float]] = None,
         video_effects: Optional[str] = None,
+        overlay: Optional[Overlay] = None,
         extra_output_args: Sequence[str] = (),
     ) -> List[str]:
         """ffmpeg arguments that cut ``ranges`` out of the source into one file.
 
         A range is ``(start, end)`` or ``(start, end, speed)``: a piece with its own speed (0.5..4.0) is
-        sped up or slowed down before the pieces are joined. ``speed`` plays the result faster or slower without changing the pitch; ``video_effects`` is an
-        ffmpeg filter chain applied before the captions; ``extra_output_args`` go just before the output.
+        sped up or slowed down before the pieces are joined. ``speed`` plays the result faster or slower
+        without changing the pitch; ``video_effects`` is an ffmpeg filter chain applied before the captions;
+        ``overlay`` (a divider or a banner) is drawn on the vertical layout, under the captions;
+        ``extra_output_args`` go just before the output.
         """
         info = self.info
         pieces = [as_piece(r) for r in ranges]
@@ -273,6 +298,9 @@ class Renderer:
         silent_input = len(runs)
         if not info.has_audio:
             args += ["-f", "lavfi", "-t", f"{out_duration:.3f}", "-i", "anullsrc=r=48000:cl=stereo"]
+        overlay_input = silent_input + (0 if info.has_audio else 1)
+        if overlay is not None and layout:
+            args += overlay.input_args()
 
         count = len(local)
         if count == 1:
@@ -313,6 +341,9 @@ class Renderer:
                                          game_zoom=game_zoom, game_shift=game_shift, split_top=split_top,
                                          game_area=game_area))
             current = "[vlay]"
+            if overlay is not None:
+                graph.append(overlay.filter(current, overlay_input, "[vovr]"))
+                current = "[vovr]"
         tail = []
         if fade > 0:
             tail.append(f"fade=t=in:st=0:d={fade:.3f},fade=t=out:st={max(0.0, out_duration - fade):.3f}:d={fade:.3f}")

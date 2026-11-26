@@ -125,7 +125,7 @@ AVE читает метаданные HEAD-запросом в начале об
  "source": {"key": "montage/buster/324159870123_2026-11-20_18-02/…mp4", "etag": "d8773630…-8", "size": 63611757, "last_modified": "…"},
  "durations": {"source": 66.05, "versions": [62.5, 64.5, 63.8]}, "captions": true,
  "variants": [{"key": "…/v1.mp4", "size": 76861234, "md5": "…", "sha256": "…", "duration": 62.5,
-               "captions": true, "spec": {"layout": "split", "caption_style": "karaoke", "…": "…"}}],
+               "captions": true, "spec": {"layout": "split", "caption_style": "karaoke", "overlay": "neon", "…": "…"}}],
  "app_version": "2.2.0", "created": "…", "stt": {"url": "http://localhost:8091/v1", "model": "kamerton"},
  "edit": {"peak": 31.5, "anchor": 28.9, "start": 14.2, "end": 44.0, "lead_in": 11.3, "lead_in_short": false,
           "search_window": [7.0, 40.0], "trigger_offset": 37.0, "cuts": 12, "speedups": [[45.1, 52.8, 2.0]],

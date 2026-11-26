@@ -26,7 +26,7 @@ auto-video-editor = "auto_video_editor.cli:main"
 include = ["auto_video_editor*"]
 
 [tool.setuptools.package-data]
-auto_video_editor = ["data/vocabulary/*.json"]
+auto_video_editor = ["data/vocabulary/*.json", "data/overlays/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

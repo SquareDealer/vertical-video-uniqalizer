@@ -152,6 +152,8 @@ class Settings:
     watch_max_failures: int = 3
     watch_threads: int = 4      # ffmpeg threads per process in auto mode, at a lower priority (0 = no limit)
     watch_emotion_url: str = "http://localhost:8092"   # emotion server of auto mode; empty = none
+    watch_overlays: bool = True  # a different divider or banner in each version (overlays.py)
+    watch_overlay_dir: str = ""  # folder with overlay.json and its assets; "" = the bundled ones
     language: str = ""  # empty = auto-detect
     beam_size: int = 5
     vocabulary: List[str] = field(default_factory=list)  # names/jargon the transcriber should know
@@ -315,6 +317,11 @@ class Settings:
             errors.append("lead_in_max must not be below lead_in_min")
         check_range("quiet_cut_max", 0, 30)
         check_range("quiet_speed", 1.25, 2.0)
+        if self.watch_overlays and self.watch_overlay_dir.strip():
+            from .overlays import check_dir
+            problem = check_dir(self.watch_overlay_dir.strip())
+            if problem:
+                errors.append(problem)
         check_range("audio_bitrate", 64, 320)
         if not re.fullmatch(r"#?[0-9a-fA-F]{6}", self.caption_color.strip()):
             errors.append("caption_color must be a hex color such as #FFE600")
