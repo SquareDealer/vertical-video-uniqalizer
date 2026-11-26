@@ -41,7 +41,7 @@ from .transcribe import (HTTP_BACKEND, SAMPLE_RATE, SpeechServer, Transcriber, T
 
 PROJECT_FILE = "project.json"
 PROJECT_VERSION = 2
-TRANSCRIPT_CACHE_VERSION = "v4"  # bump when transcription parameters change
+TRANSCRIPT_CACHE_VERSION = "v5"  # bump when transcription parameters or the audio clock change
 
 # Settings that change which moments are picked. Changing them requires a new analysis.
 ANALYSIS_KEYS = (
@@ -517,7 +517,7 @@ class Pipeline:
         key = hashlib.sha1(server.url.encode("utf-8")).hexdigest()[:8]
         path = self._cache_file("emotions", f"{media_fingerprint(info.path)}-{key}"
                                             f"{'' if track_no == 1 else f'-t{track_no}'}"
-                                            f"-w{EMOTION_WINDOW:g}-h{EMOTION_HOP:g}-v1.json")
+                                            f"-w{EMOTION_WINDOW:g}-h{EMOTION_HOP:g}-v2.json")
         if s.use_cache and path.exists():
             cached = load_emotions(path)
             if cached is not None:
@@ -588,7 +588,7 @@ class Pipeline:
     def _envelope_path(self, info: MediaInfo) -> Path:
         track = self._track(info, "audio_track")
         suffix = "" if track == 1 else f"-t{track}"
-        return self._cache_file("audio", f"{media_fingerprint(info.path)}-v1{suffix}.npz")
+        return self._cache_file("audio", f"{media_fingerprint(info.path)}-v2{suffix}.npz")
 
     def _load_envelope(self, info: MediaInfo) -> AudioEnvelope:
         s, r = self.settings, self.reporter

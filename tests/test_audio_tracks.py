@@ -25,7 +25,7 @@ def test_audio_input():
 
 def test_pcm_reader_reads_the_chosen_track():
     cmd = pcm_reader_command("in.mkv", 16000, track=2, track_count=3)
-    assert cmd[cmd.index("-filter_complex") + 1] == "[0:a:1]anull[pcm]"
+    assert cmd[cmd.index("-filter_complex") + 1] == "[0:a:1]aresample=async=1:first_pts=0[pcm]"
 
 
 def test_render_uses_the_output_track():

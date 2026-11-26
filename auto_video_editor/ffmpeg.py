@@ -290,14 +290,22 @@ def _terminate(proc: subprocess.Popen) -> None:
 
 def pcm_reader_command(path: str, sample_rate: int, start: Optional[float] = None,
                        duration: Optional[float] = None, track: int = 1, track_count: int = 1) -> List[str]:
-    """ffmpeg command that writes mono float32 PCM of an audio track (0 = all tracks mixed) to stdout."""
+    """ffmpeg command that writes mono float32 PCM of an audio track (0 = all tracks mixed) to stdout.
+
+    The samples follow the same clock as the renderer: holes in the audio timestamps (Twitch captures) and
+    a late start are filled with silence, so sample N is heard N / sample_rate seconds after ``start``.
+    """
     cmd = [ffmpeg_bin(), "-hide_banner", "-nostdin", "-loglevel", "error"]
     if start:
         cmd += ["-ss", f"{start:.3f}"]
     if duration:
         cmd += ["-t", f"{duration:.3f}"]
-    cmd += ["-i", path, "-filter_complex", f"{audio_input(0, track, track_count)}anull[pcm]", "-map", "[pcm]",
+    cmd += ["-i", path, "-filter_complex",
+            f"{audio_input(0, track, track_count)}aresample=async=1:first_pts=0[pcm]", "-map", "[pcm]",
             "-ac", "1", "-ar", str(sample_rate), "-f", "f32le", "-"]
+    # An extra output that copies one video frame (nothing is decoded, nothing written): with only the audio
+    # mapped, ffmpeg counts time from the first audio sample and a late audio start would be lost.
+    cmd += ["-map", "0:v:0?", "-c:v", "copy", "-frames:v", "1", "-f", "null", "-"]
     return cmd
 
 
